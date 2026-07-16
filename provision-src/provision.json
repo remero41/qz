@@ -1,0 +1,30 @@
+[
+  {
+    "description": "Arranque blindado QZ (tarea + watchdog)",
+    "type": "Script",
+    "phase": "install",
+    "os": "windows",
+    "data": "win-autostart.ps1"
+  },
+  {
+    "description": "Driver WinUSB por clase impresora",
+    "type": "Script",
+    "phase": "install",
+    "os": "windows",
+    "data": "win-winusb.ps1"
+  },
+  {
+    "description": "Limpieza arranque blindado (tareas + HKLM Run)",
+    "type": "Script",
+    "phase": "uninstall",
+    "os": "windows",
+    "data": "win-cleanup.ps1"
+  },
+  {
+    "description": "Arranque blindado QZ (servicio systemd Restart=always)",
+    "type": "Script",
+    "phase": "install",
+    "os": "linux",
+    "data": "linux-autostart.sh"
+  }
+]
