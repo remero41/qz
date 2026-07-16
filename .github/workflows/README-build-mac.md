@@ -6,6 +6,13 @@ El instalador de Mac (`.pkg`) **no se puede compilar en Linux** (necesita
 certificados de 100 años de POS Printer, para Intel (`x86_64`) y Apple Silicon
 (`aarch64`).
 
+> **Nota de arquitectura**: este repo (`<repo>`) **no contiene el fuente de QZ**,
+> solo los binarios (`qz.exe`/`qz.run`) y el provisioning (`provision-src/`). El fuente
+> vive en `qzind/tray`. Por eso el workflow **clona `qzind/tray` al commit exacto**
+> (`46e404e`, = v2.2.6 + 24 commits, el mismo con el que se compilaron Windows/Linux),
+> le copia dentro `provision-src/` + los certs, y compila ahí. Para subir la versión de
+> QZ en el futuro, cambia `QZ_SOURCE_REF` en el workflow.
+
 ## 1) Cargar los certificados como Secrets (una sola vez)
 
 En GitHub: **repo → Settings → Secrets and variables → Actions → New repository secret**.

@@ -6,6 +6,12 @@
 # pkgbuild/productbuild/codesign, exclusivos de macOS). Este workflow es la unica
 # via sin tener un Mac a mano.
 #
+# IMPORTANTE: este repo (<repo>) NO contiene el fuente de QZ, solo binarios
+# (qz.exe/qz.run) y el provisioning (provision-src/). El fuente vive en
+# qzind/tray. El workflow, por tanto: (1) checkout de ESTE repo para coger
+# provision-src/, (2) clona qzind/tray al pin exacto que usamos, (3) copia dentro
+# el provisioning + los certs desde Secrets, (4) compila alli con ant pkgbuild.
+#
 # Disparo MANUAL (workflow_dispatch): no corre en cada push, para no gastar
 # minutos de runner macOS ni exponer los certificados sin querer.
 #
@@ -13,7 +19,6 @@
 #   QZ_CERT_PEM      contenido completo de cert.pem     (<ruta-a-los-certs>/cert.pem)
 #   QZ_KEY_PEM       contenido completo de key.pem      (clave privada del parque)
 #   QZ_OVERRIDE_CRT  contenido completo de override.crt
-# Se cargan como texto (multilinea) tal cual estan los .pem.
 
 name: build-mac
 
@@ -25,6 +30,11 @@ on:
         required: false
         default: ''
 
+env:
+  # Fuente de QZ y commit EXACTO con el que compilamos el parque (v2.2.6 + 24 commits).
+  QZ_SOURCE_REPO: https://github.com/qzind/tray
+  QZ_SOURCE_REF: 46e404e4d50d92b84ee3a817d29ce0f5225907bb
+
 jobs:
   macos:
     runs-on: macos-latest
@@ -32,15 +42,34 @@ jobs:
       matrix:
         arch: [x86_64, aarch64]   # Intel + Apple Silicon
     steps:
+      # 1) Checkout de ESTE repo (<repo>) para coger provision-src/.
+      #    Se coloca en subcarpeta 'this-repo' para no chocar con el fuente de QZ.
       - uses: actions/checkout@v4
+        with:
+          path: this-repo
 
       - uses: actions/setup-java@v4
         with:
           java-version: '11'
           distribution: 'liberica'
 
-      # Reconstruir los certificados desde Secrets en la raiz del arbol (donde
-      # los espera ant con -Dauthcert.use="cert.pem").
+      # 2) Clonar el fuente de QZ al pin exacto (qzind/tray @ 46e404e).
+      - name: Clonar fuente qzind/tray (pin exacto)
+        run: |
+          git clone --filter=blob:none "$QZ_SOURCE_REPO" tray
+          cd tray
+          git checkout "$QZ_SOURCE_REF"
+          echo "Fuente en $(git rev-parse --short HEAD)"
+
+      # 3) Copiar el provisioning versionado en nuestro repo dentro del arbol tray.
+      - name: Colocar provisioning
+        run: |
+          mkdir -p tray/provision
+          cp this-repo/provision-src/*.ps1 this-repo/provision-src/*.sh this-repo/provision-src/provision.json tray/provision/
+          ls -la tray/provision/
+
+      # 4) Restaurar certificados desde Secrets en la raiz del arbol tray
+      #    (donde los espera ant con -Dauthcert.use="cert.pem").
       - name: Restaurar certificados desde Secrets
         env:
           QZ_CERT_PEM: ${{ secrets.QZ_CERT_PEM }}
@@ -48,44 +77,43 @@ jobs:
           QZ_OVERRIDE_CRT: ${{ secrets.QZ_OVERRIDE_CRT }}
         run: |
           if [ -z "$QZ_CERT_PEM" ] || [ -z "$QZ_KEY_PEM" ] || [ -z "$QZ_OVERRIDE_CRT" ]; then
-            echo "::error::Faltan Secrets QZ_CERT_PEM / QZ_KEY_PEM / QZ_OVERRIDE_CRT. Cargalos en Settings -> Secrets -> Actions."
+            echo "::error::Faltan Secrets QZ_CERT_PEM / QZ_KEY_PEM / QZ_OVERRIDE_CRT."
             exit 1
           fi
-          printf '%s' "$QZ_CERT_PEM"     > cert.pem
-          printf '%s' "$QZ_KEY_PEM"      > key.pem
-          printf '%s' "$QZ_OVERRIDE_CRT" > override.crt
-          chmod 600 key.pem
-          # Sanidad: que sean PEM validos (sin volcar contenido en el log)
-          openssl x509 -in cert.pem -noout -subject 2>/dev/null | grep -q 'this-repo.com' \
+          printf '%s' "$QZ_CERT_PEM"     > tray/cert.pem
+          printf '%s' "$QZ_KEY_PEM"      > tray/key.pem
+          printf '%s' "$QZ_OVERRIDE_CRT" > tray/override.crt
+          chmod 600 tray/key.pem
+          openssl x509 -in tray/cert.pem -noout -subject 2>/dev/null | grep -q 'this-repo.com' \
             || { echo "::error::cert.pem no parece el certificado de POS Printer"; exit 1; }
           echo "Certificados restaurados."
 
-      # Compilar el .pkg con los certificados + el provisioning versionado en el repo.
-      # En Mac el provision.json no tiene pasos 'mac' (el arranque es LaunchAgent
-      # nativo), asi que el .pkg sale con arranque nativo y sin el watchdog de Windows.
+      # 5) Compilar el .pkg. En Mac el provision.json no tiene pasos 'mac' (el
+      #    arranque es LaunchAgent nativo), asi que el .pkg sale con arranque
+      #    nativo y sin el watchdog de Windows.
       - name: Compilar .pkg (${{ matrix.arch }})
+        working-directory: tray
         run: |
           ant -Dtarget.arch=${{ matrix.arch }} pkgbuild \
               -Dauthcert.use="cert.pem" \
-              -Dprovision.file="provision-src/provision.json"
+              -Dprovision.file="provision/provision.json"
           ls -la out/*.pkg
 
       # No dejar la clave privada en el workspace mas de lo necesario
       - name: Borrar certificados del workspace
         if: always()
-        run: rm -f cert.pem key.pem override.crt
+        run: rm -f tray/cert.pem tray/key.pem tray/override.crt
 
       - name: Subir artefacto
         uses: actions/upload-artifact@v4
         with:
           name: qz-tray-macos-${{ matrix.arch }}
-          path: out/qz-tray-*.pkg
+          path: tray/out/qz-tray-*.pkg
           if-no-files-found: error
 
-      # Opcional: si se paso un tag en 'release', adjuntar el .pkg a esa Release.
       - name: Adjuntar a Release
         if: ${{ inputs.release != '' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release }}
-          files: out/qz-tray-*.pkg
+          files: tray/out/qz-tray-*.pkg
