@@ -2,13 +2,12 @@
 
 El instalador de Mac (`.pkg`) **no se puede compilar en Linux** (necesita
 `pkgbuild`/`productbuild`/`codesign`, exclusivos de macOS). El workflow
-`build-mac.yaml` lo compila en un runner `macos-latest` de GitHub, con los
-certificados de 100 años de POS Printer, para Intel (`x86_64`) y Apple Silicon
-(`aarch64`).
+`build-mac.yaml` lo compila en un runner `macos-latest` de GitHub, con un juego de
+certificados propios, para Intel (`x86_64`) y Apple Silicon (`aarch64`).
 
-> **Nota de arquitectura**: este repo (`<repo>`) **no contiene el fuente de QZ**,
-> solo los binarios (`qz.exe`/`qz.run`) y el provisioning (`provision-src/`). El fuente
-> vive en `qzind/tray`. Por eso el workflow **clona `qzind/tray` al commit exacto**
+> **Nota de arquitectura**: este repo **no contiene el fuente de QZ**, solo los
+> binarios (`qz.exe`/`qz.run`) y el provisioning (`provision-src/`). El fuente vive
+> en `qzind/tray`. Por eso el workflow **clona `qzind/tray` al commit exacto**
 > (`46e404e`, = v2.2.6 + 24 commits, el mismo con el que se compilaron Windows/Linux),
 > le copia dentro `provision-src/` + los certs, y compila ahí. Para subir la versión de
 > QZ en el futuro, cambia `QZ_SOURCE_REF` en el workflow.
@@ -16,8 +15,8 @@ certificados de 100 años de POS Printer, para Intel (`x86_64`) y Apple Silicon
 ## 1) Cargar los certificados como Secrets (una sola vez)
 
 En GitHub: **repo → Settings → Secrets and variables → Actions → New repository secret**.
-Crea estos tres secrets pegando el **contenido completo** de cada fichero de
-`<ruta-a-los-certs>/`:
+Crea estos tres secrets pegando el **contenido completo** de cada fichero de tu
+carpeta de certificados:
 
 | Secret | Fichero de origen |
 |--------|-------------------|
@@ -32,6 +31,10 @@ gh secret set QZ_CERT_PEM     < <ruta-a-los-certs>/cert.pem
 gh secret set QZ_KEY_PEM      < <ruta-a-los-certs>/key.pem
 gh secret set QZ_OVERRIDE_CRT < <ruta-a-los-certs>/override.crt
 ```
+
+Opcional: define una **variable** `QZ_CERT_CN_MATCH` (Settings → Variables) con un
+texto que deba aparecer en el subject del cert; el workflow lo usa como comprobación
+de sanidad. Si no la defines, se omite la comprobación.
 
 > ⚠️ `key.pem` es la clave privada que da confianza a TODO el parque. Al cargarla
 > como Secret vive cifrada en GitHub y es accesible a admins del repo y a quien

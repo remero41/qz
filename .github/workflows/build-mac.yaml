@@ -1,24 +1,26 @@
 # Compila el instalador .pkg de QZ Tray para macOS (Intel + Apple Silicon) en
-# un runner macOS de GitHub Actions, con los certificados de 100 anos de POS Printer
-# (CN=*.this-repo.com) para que QZ imprima sin dialogo de confianza.
+# un runner macOS de GitHub Actions, con un juego de certificados propios para que
+# QZ imprima sin dialogo de confianza.
 #
 # Por que existe: el .pkg de Mac NO se puede compilar desde Linux (necesita
 # pkgbuild/productbuild/codesign, exclusivos de macOS). Este workflow es la unica
 # via sin tener un Mac a mano.
 #
-# IMPORTANTE: este repo (<repo>) NO contiene el fuente de QZ, solo binarios
-# (qz.exe/qz.run) y el provisioning (provision-src/). El fuente vive en
-# qzind/tray. El workflow, por tanto: (1) checkout de ESTE repo para coger
-# provision-src/, (2) clona qzind/tray al pin exacto que usamos, (3) copia dentro
-# el provisioning + los certs desde Secrets, (4) compila alli con ant pkgbuild.
+# IMPORTANTE: este repo NO contiene el fuente de QZ, solo binarios (qz.exe/qz.run)
+# y el provisioning (provision-src/). El fuente vive en qzind/tray. El workflow,
+# por tanto: (1) checkout de ESTE repo para coger provision-src/, (2) clona
+# qzind/tray al pin exacto que usamos, (3) copia dentro el provisioning + los certs
+# desde Secrets, (4) compila alli con ant pkgbuild.
 #
 # Disparo MANUAL (workflow_dispatch): no corre en cada push, para no gastar
 # minutos de runner macOS ni exponer los certificados sin querer.
 #
 # SECRETS necesarios (Settings -> Secrets and variables -> Actions):
-#   QZ_CERT_PEM      contenido completo de cert.pem     (<ruta-a-los-certs>/cert.pem)
-#   QZ_KEY_PEM       contenido completo de key.pem      (clave privada del parque)
+#   QZ_CERT_PEM      contenido completo de cert.pem
+#   QZ_KEY_PEM       contenido completo de key.pem (clave privada del parque)
 #   QZ_OVERRIDE_CRT  contenido completo de override.crt
+# VARIABLE opcional (Settings -> Variables): QZ_CERT_CN_MATCH = texto que debe
+#   contener el subject del cert (comprobacion de sanidad). Si no se define, se omite.
 
 name: build-mac
 
@@ -31,7 +33,7 @@ on:
         default: ''
 
 env:
-  # Fuente de QZ y commit EXACTO con el que compilamos el parque (v2.2.6 + 24 commits).
+  # Fuente de QZ y commit EXACTO con el que se compila el parque (v2.2.6 + 24 commits).
   QZ_SOURCE_REPO: https://github.com/qzind/tray
   QZ_SOURCE_REF: 46e404e4d50d92b84ee3a817d29ce0f5225907bb
 
@@ -42,7 +44,7 @@ jobs:
       matrix:
         arch: [x86_64, aarch64]   # Intel + Apple Silicon
     steps:
-      # 1) Checkout de ESTE repo (<repo>) para coger provision-src/.
+      # 1) Checkout de ESTE repo para coger provision-src/.
       #    Se coloca en subcarpeta 'this-repo' para no chocar con el fuente de QZ.
       - uses: actions/checkout@v4
         with:
@@ -75,6 +77,7 @@ jobs:
           QZ_CERT_PEM: ${{ secrets.QZ_CERT_PEM }}
           QZ_KEY_PEM: ${{ secrets.QZ_KEY_PEM }}
           QZ_OVERRIDE_CRT: ${{ secrets.QZ_OVERRIDE_CRT }}
+          QZ_CERT_CN_MATCH: ${{ vars.QZ_CERT_CN_MATCH }}
         run: |
           if [ -z "$QZ_CERT_PEM" ] || [ -z "$QZ_KEY_PEM" ] || [ -z "$QZ_OVERRIDE_CRT" ]; then
             echo "::error::Faltan Secrets QZ_CERT_PEM / QZ_KEY_PEM / QZ_OVERRIDE_CRT."
@@ -84,8 +87,12 @@ jobs:
           printf '%s' "$QZ_KEY_PEM"      > tray/key.pem
           printf '%s' "$QZ_OVERRIDE_CRT" > tray/override.crt
           chmod 600 tray/key.pem
-          openssl x509 -in tray/cert.pem -noout -subject 2>/dev/null | grep -q 'this-repo.com' \
-            || { echo "::error::cert.pem no parece el certificado de POS Printer"; exit 1; }
+          # Comprobacion de sanidad opcional: si se define la variable QZ_CERT_CN_MATCH,
+          # el subject del cert debe contenerla (asi el CN no queda hardcodeado aqui).
+          if [ -n "$QZ_CERT_CN_MATCH" ]; then
+            openssl x509 -in tray/cert.pem -noout -subject 2>/dev/null | grep -q "$QZ_CERT_CN_MATCH" \
+              || { echo "::error::cert.pem no coincide con QZ_CERT_CN_MATCH."; exit 1; }
+          fi
           echo "Certificados restaurados."
 
       # 5) Compilar el .pkg. En Mac el provision.json no tiene pasos 'mac' (el

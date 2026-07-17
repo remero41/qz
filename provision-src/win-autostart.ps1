@@ -220,7 +220,7 @@ $xmlAutostart = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="$ns">
   <RegistrationInfo>
-    <Description>Arranca QZ Tray al iniciar sesion cualquier usuario, via watchdog con dedupe (POS Printer)</Description>
+    <Description>Arranca QZ Tray al iniciar sesion cualquier usuario, via watchdog con dedupe</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
@@ -259,7 +259,7 @@ $xmlWatchdog = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="$ns">
   <RegistrationInfo>
-    <Description>Vigila QZ Tray cada 2 min: relanza si murio, reinicia si esta zombi (POS Printer)</Description>
+    <Description>Vigila QZ Tray cada 2 min: relanza si murio, reinicia si esta zombi</Description>
   </RegistrationInfo>
   <Triggers>
     <TimeTrigger>

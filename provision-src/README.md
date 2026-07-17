@@ -1,22 +1,22 @@
-# Provisioning de compilación de QZ Tray (POS Printer)
+# Provisioning de compilación de QZ Tray
 
 Estos son los scripts de **provisioning** con los que se compilan `qz.exe` (Windows)
-y `qz.run` (Linux) de este repo. Se copian a `~/qzcompilation/tray/provision/` y se
-pasan a `ant` con `-Dprovision.file="provision/provision.json"`.
+y `qz.run` (Linux) de este repo. Se copian a la carpeta `provision/` del árbol de
+compilación de QZ y se pasan a `ant` con `-Dprovision.file="provision/provision.json"`.
 
 > **No son los binarios**: `qz.exe`/`qz.run` (raíz del repo, en Git LFS) llevan estos
 > scripts ya embebidos. Esta carpeta es la **fuente/receta** para trazabilidad.
 
 ## Certificados
 
-Se compila con los certificados de 100 años en `<ruta-a-los-certs>`
-(`cert.pem` `CN=*.this-repo.com`, `key.pem`, `override.crt`). **NO regenerar** —
-rompería la confianza de todo el parque ya instalado.
+Se compila con un juego de certificados propios (`cert.pem`, `key.pem`, `override.crt`)
+para que QZ imprima sin diálogo de confianza. **NO regenerar** — rompería la confianza
+de todo el parque ya instalado.
 
 ## Comandos de compilación
 
 ```bash
-cd ~/qzcompilation/tray
+cd <árbol-de-compilación-de-qz>
 cp <ruta-a-los-certs>/cert.pem <ruta-a-los-certs>/key.pem <ruta-a-los-certs>/override.crt .
 cp <ruta-a-esta-carpeta>/*.ps1 <ruta>/*.sh <ruta>/provision.json provision/
 
