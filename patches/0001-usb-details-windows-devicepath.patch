@@ -58,10 +58,10 @@ index 93466d6..c9b3669 100644
  
 diff --git a/src/qz/utils/WindowsUsbInfo.java b/src/qz/utils/WindowsUsbInfo.java
 new file mode 100644
-index 0000000..46ceb6b
+index 0000000..548aa11
 --- /dev/null
 +++ b/src/qz/utils/WindowsUsbInfo.java
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,145 @@
 +package qz.utils;
 +
 +import java.util.*;
@@ -154,15 +154,25 @@ index 0000000..46ceb6b
 +
 +    private static final String ENUM_USB = "SYSTEM\\CurrentControlSet\\Enum\\USB";
 +
++    private static final org.apache.logging.log4j.Logger log =
++            org.apache.logging.log4j.LogManager.getLogger(WindowsUsbInfo.class);
++
 +    /** Lee el registro USB de Windows y produce el mapa "vvvv:pppp"→DeviceInfo.
 +     *  Devuelve {} si no es Windows o ante cualquier error (fail-safe: TPV degrada a cola). */
 +    public static Map<String,DeviceInfo> readRegistry(){
 +        if(!SystemUtilities.isWindows()) return Collections.emptyMap();
 +        Map<String,Map<String,String>> reg = new HashMap<>();
++        int topKeys = 0, instKeys = 0;
 +        try {
-+            for(String vidpid : Advapi32Util.registryGetKeys(WinReg.HKEY_LOCAL_MACHINE, ENUM_USB)){
++            String[] vidpids = Advapi32Util.registryGetKeys(WinReg.HKEY_LOCAL_MACHINE, ENUM_USB);
++            topKeys = vidpids.length;
++            for(String vidpid : vidpids){
 +                String base = ENUM_USB+"\\"+vidpid;
-+                for(String inst : Advapi32Util.registryGetKeys(WinReg.HKEY_LOCAL_MACHINE, base)){
++                String[] insts;
++                try { insts = Advapi32Util.registryGetKeys(WinReg.HKEY_LOCAL_MACHINE, base); }
++                catch(Exception e){ log.warn("WindowsUsbInfo: no puedo leer instancias de {}: {}", vidpid, e.toString()); continue; }
++                for(String inst : insts){
++                    instKeys++;
 +                    String key = base+"\\"+inst;
 +                    Map<String,String> v = new HashMap<>();
 +                    putIfString(v,"Service", key,"Service");
@@ -176,8 +186,16 @@ index 0000000..46ceb6b
 +                    reg.put(vidpid+"\\"+inst, v);
 +                }
 +            }
-+        } catch(Exception e){ return Collections.emptyMap(); }
-+        return parse(reg);
++        } catch(Exception e){
++            log.error("WindowsUsbInfo.readRegistry falló leyendo {} (¿permisos?): {}", ENUM_USB, e.toString());
++            return Collections.emptyMap();
++        }
++        Map<String,DeviceInfo> out = parse(reg);
++        log.info("WindowsUsbInfo: {} claves VID/PID, {} instancias, {} impresoras detectadas", topKeys, instKeys, out.size());
++        for(DeviceInfo d : out.values()){
++            log.info("  → {}:{} class={} devicePath={} friendly={}", d.vendorId, d.productId, d.printerClass, d.devicePath, d.friendlyName);
++        }
++        return out;
 +    }
 +
 +    private static void putIfString(Map<String,String> v, String field, String key, String value){
