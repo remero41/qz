@@ -58,10 +58,10 @@ index 93466d6..c9b3669 100644
  
 diff --git a/src/qz/utils/WindowsUsbInfo.java b/src/qz/utils/WindowsUsbInfo.java
 new file mode 100644
-index 0000000..548aa11
+index 0000000..c94d2ce
 --- /dev/null
 +++ b/src/qz/utils/WindowsUsbInfo.java
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,150 @@
 +package qz.utils;
 +
 +import java.util.*;
@@ -128,7 +128,12 @@ index 0000000..548aa11
 +            d.vendorId=vid.toLowerCase(); d.productId=pid.toLowerCase();
 +            d.printerClass=service; d.ieee1284=ieee;
 +            d.friendlyName=v.getOrDefault("FriendlyName", v.get("DeviceDesc"));
-+            d.usbPort=v.get("Port"); // Port de spooler ("USB001"); poblado en readRegistry, validar con papel
++            // usbPort (cruce cola↔dispositivo para printers.details): HOY queda null.
++            // El "Port" de spooler ("USB001") NO vive bajo Enum\USB\...\instance, sino
++            // en Control\Print\Printers\<cola>\Port → resolvePortToDevice devuelve null
++            // y details NO se enriquece. NO se usa para el USB directo (ese path lo da
++            // listDevices, no details). PENDIENTE si se quiere el select por cola.
++            d.usbPort=v.get("Port"); // siempre null hoy (no hay "Port" en este subárbol)
 +            boolean usbprint = service!=null && service.equalsIgnoreCase("usbprint");
 +            d.devicePath = usbprint ? buildDevicePath(vid,pid,instanceId) : null;
 +            out.put(d.vendorId+":"+d.productId, d);
