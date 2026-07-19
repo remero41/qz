@@ -142,15 +142,23 @@ jobs:
         shell: bash
         working-directory: tray
         run: |
-          ARGS="-Dprovision.file=provision/provision.json"
+          # Ruta explicita a makensis.exe: la deteccion de ant (nsisbin-from-64)
+          # depende de %ProgramFiles(x86)% y falla en el runner (cae a "makensis"
+          # pelado, que no esta en PATH). -Dnsisbin gana sobre la <property>.
+          NSIS_EXE="/c/Program Files (x86)/NSIS/makensis.exe"
+          if [ ! -f "$NSIS_EXE" ]; then NSIS_EXE="/c/Program Files/NSIS/makensis.exe"; fi
+          echo "makensis: $NSIS_EXE"; [ -f "$NSIS_EXE" ] || { echo "::error::makensis.exe no encontrado"; exit 1; }
+          NSIS_WIN=$(cygpath -w "$NSIS_EXE")
+          # Array para preservar los espacios de la ruta de makensis como UN arg.
+          ARGS=(-Dprovision.file=provision/provision.json "-Dnsisbin=$NSIS_WIN")
           if [ -n "${{ steps.authcert.outputs.authcert }}" ]; then
-            ARGS="$ARGS -Dauthcert.use=cert.pem"
+            ARGS+=(-Dauthcert.use=cert.pem)
           fi
           if [ "${{ steps.signkeystore.outputs.have }}" = "1" ]; then
-            ARGS="$ARGS -Dsigning.keystore=signing.p12 -Dsigning.alias=${{ secrets.WIN_SIGNING_ALIAS }} -Dsigning.storepass=${{ secrets.WIN_SIGNING_STOREPASS }}"
+            ARGS+=(-Dsigning.keystore=signing.p12 "-Dsigning.alias=${{ secrets.WIN_SIGNING_ALIAS }}" "-Dsigning.storepass=${{ secrets.WIN_SIGNING_STOREPASS }}")
           fi
-          echo "ant nsis $ARGS"
-          ant nsis $ARGS
+          echo "ant nsis ${ARGS[*]}"
+          ant nsis "${ARGS[@]}"
           ls -la out/*.exe
 
       # No dejar secretos en el workspace.
