@@ -1,0 +1,273 @@
+diff --git a/src/qz/printer/PrintServiceMatcher.java b/src/qz/printer/PrintServiceMatcher.java
+index b1f5061..84abc64 100644
+--- a/src/qz/printer/PrintServiceMatcher.java
++++ b/src/qz/printer/PrintServiceMatcher.java
+@@ -204,6 +204,18 @@ public class PrintServiceMatcher {
+                 jsonService.put("driver", printer.getDriver().value());
+                 jsonService.put("connection", printer.getConnection());
+                 jsonService.put("default", ps == defaultService);
++
++                // Windows: cruzar la cola con su dispositivo USB (path real + vid/pid). Aditivo:
++                // si no resuelve, no se añade nada y el TPV degrada a cola.
++                if(qz.utils.SystemUtilities.isWindows()) {
++                    qz.utils.WindowsUsbInfo.DeviceInfo dev =
++                            qz.utils.WindowsUsbInfo.resolvePortToDevice(printer.getConnection(), qz.utils.WindowsUsbInfo.readRegistry());
++                    if(dev != null) {
++                        if(dev.devicePath != null) jsonService.put("devicePath", dev.devicePath);
++                        if(dev.vendorId != null)   jsonService.put("vendorId", dev.vendorId);
++                        if(dev.productId != null)  jsonService.put("productId", dev.productId);
++                    }
++                }
+                 if(debug) log.debug("'{}': '{}' (Driver)", printer.getPrinterId(), printer.getDriver().value());
+                 if(debug) log.debug("'{}': '{}' (Connection)", printer.getPrinterId(), printer.getConnection());
+ 
+diff --git a/src/qz/utils/UsbUtilities.java b/src/qz/utils/UsbUtilities.java
+index 93466d6..c9b3669 100644
+--- a/src/qz/utils/UsbUtilities.java
++++ b/src/qz/utils/UsbUtilities.java
+@@ -18,6 +18,7 @@ import javax.usb.*;
+ import javax.usb.util.UsbUtil;
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.Map;
+ 
+ public class UsbUtilities {
+ 
+@@ -75,6 +76,10 @@ public class UsbUtilities {
+         List<UsbDevice> devices = getUsbDevices(includeHubs);
+         JSONArray deviceJSON = new JSONArray();
+ 
++        // Windows: leer el registro USB UNA vez y cruzar por VID:PID (path real + clase + friendlyName).
++        Map<String, WindowsUsbInfo.DeviceInfo> usbInfo =
++                qz.utils.SystemUtilities.isWindows() ? WindowsUsbInfo.readRegistry() : java.util.Collections.emptyMap();
++
+         for(UsbDevice device : devices) {
+             UsbDeviceDescriptor desc = device.getUsbDeviceDescriptor();
+ 
+@@ -83,6 +88,11 @@ public class UsbUtilities {
+             descJSON.put("productId", UsbUtil.toHexString(desc.idProduct()));
+             descJSON.put("hub", device.isUsbHub());
+ 
++            if(!usbInfo.isEmpty()) {
++                String key = (UsbUtil.toHexString(desc.idVendor())+":"+UsbUtil.toHexString(desc.idProduct())).toLowerCase();
++                WindowsUsbInfo.applyTo(descJSON, usbInfo.get(key));
++            }
++
+             deviceJSON.put(descJSON);
+         }
+ 
+diff --git a/src/qz/utils/WindowsUsbInfo.java b/src/qz/utils/WindowsUsbInfo.java
+new file mode 100644
+index 0000000..46ceb6b
+--- /dev/null
++++ b/src/qz/utils/WindowsUsbInfo.java
+@@ -0,0 +1,127 @@
++package qz.utils;
++
++import java.util.*;
++import com.sun.jna.platform.win32.Advapi32Util;
++import com.sun.jna.platform.win32.WinReg;
++import org.codehaus.jettison.json.JSONObject;
++import org.codehaus.jettison.json.JSONException;
++
++/**
++ * Enriquecimiento de dispositivos USB en Windows a partir del registro
++ * (SYSTEM\CurrentControlSet\Enum\USB). Produce, por par VID:PID, la clase de
++ * servicio (usbprint/TMUSB/...), el friendlyName, el IEEE-1284 (si existe) y el
++ * device path usbprint REAL (con el instance ID del dispositivo, no una ruta
++ * inventada). Todo campo es ADITIVO: QZ viejo no lo emite y el TPV degrada a cola.
++ *
++ * La lógica de parseo (registro→DeviceInfo) es pura y testeable sin Windows; la
++ * lectura real del registro (readRegistry) va tras isWindows().
++ */
++public class WindowsUsbInfo {
++    private static final String USBPRINT_GUID = "{28d78fad-5a12-11d1-ae5b-0000f803a8c2}";
++
++    public static class DeviceInfo {
++        public String vendorId, productId, printerClass, ieee1284, friendlyName, devicePath, usbPort;
++    }
++
++    /** Cruza el Port de spooler ("USB001") con el DeviceInfo cuyo usbPort coincida.
++     *  Devuelve null si no resuelve (el TPV degrada al select op.1 / cola). */
++    public static DeviceInfo resolvePortToDevice(String port, Map<String,DeviceInfo> info){
++        if(port==null || info==null) return null;
++        for(DeviceInfo d: info.values()){
++            if(port.equalsIgnoreCase(d.usbPort)) return d;
++        }
++        return null;
++    }
++
++    public static String buildDevicePath(String vid, String pid, String instanceId){
++        return "\\\\.\\USB#VID_"+vid.toUpperCase()+"&PID_"+pid.toUpperCase()
++             +"#"+instanceId+"#"+USBPRINT_GUID+"\\dummy";
++    }
++
++    private static boolean isPrinter(String service, String ieee){
++        if(service==null) return ieee!=null;
++        String s=service.toLowerCase();
++        return s.equals("usbprint") || s.equals("tmusb") || (ieee!=null);
++    }
++
++    /** regEnum: "VID_xxxx&PID_yyyy\\<instanceId>" -> { Service, FriendlyName, IEEE1284, ... } */
++    public static Map<String,DeviceInfo> parse(Map<String,Map<String,String>> regEnum){
++        Map<String,DeviceInfo> out=new HashMap<>();
++        for(Map.Entry<String,Map<String,String>> e: regEnum.entrySet()){
++            String path=e.getKey();
++            int slash=path.lastIndexOf('\\');
++            if(slash<0) continue;
++            String vidpid=path.substring(0,slash);       // VID_xxxx&PID_yyyy
++            String instanceId=path.substring(slash+1);
++            String vid=extract(vidpid,"VID_");
++            String pid=extract(vidpid,"PID_");
++            if(vid==null||pid==null) continue;
++            Map<String,String> v=e.getValue();
++            String service=v.get("Service");
++            String ieee=v.get("IEEE1284");
++            if(!isPrinter(service,ieee)) continue;
++            DeviceInfo d=new DeviceInfo();
++            d.vendorId=vid.toLowerCase(); d.productId=pid.toLowerCase();
++            d.printerClass=service; d.ieee1284=ieee;
++            d.friendlyName=v.getOrDefault("FriendlyName", v.get("DeviceDesc"));
++            d.usbPort=v.get("Port"); // Port de spooler ("USB001"); poblado en readRegistry, validar con papel
++            boolean usbprint = service!=null && service.equalsIgnoreCase("usbprint");
++            d.devicePath = usbprint ? buildDevicePath(vid,pid,instanceId) : null;
++            out.put(d.vendorId+":"+d.productId, d);
++        }
++        return out;
++    }
++
++    private static String extract(String s, String key){
++        int i=s.indexOf(key); if(i<0) return null;
++        String rest=s.substring(i+key.length());
++        int amp=rest.indexOf('&'); if(amp>=0) rest=rest.substring(0,amp);
++        return rest.length()>=4 ? rest.substring(0,4) : rest;
++    }
++
++    /** Vuelca los campos ADITIVOS de un DeviceInfo sobre un JSONObject de dispositivo/cola. */
++    public static void applyTo(JSONObject o, DeviceInfo d) throws JSONException {
++        if(d==null) return;
++        if(d.printerClass!=null) o.put("printerClass", d.printerClass);
++        if(d.ieee1284!=null)     o.put("ieee1284", d.ieee1284);
++        if(d.friendlyName!=null) o.put("friendlyName", d.friendlyName);
++        if(d.devicePath!=null)   o.put("devicePath", d.devicePath);
++    }
++
++    private static final String ENUM_USB = "SYSTEM\\CurrentControlSet\\Enum\\USB";
++
++    /** Lee el registro USB de Windows y produce el mapa "vvvv:pppp"→DeviceInfo.
++     *  Devuelve {} si no es Windows o ante cualquier error (fail-safe: TPV degrada a cola). */
++    public static Map<String,DeviceInfo> readRegistry(){
++        if(!SystemUtilities.isWindows()) return Collections.emptyMap();
++        Map<String,Map<String,String>> reg = new HashMap<>();
++        try {
++            for(String vidpid : Advapi32Util.registryGetKeys(WinReg.HKEY_LOCAL_MACHINE, ENUM_USB)){
++                String base = ENUM_USB+"\\"+vidpid;
++                for(String inst : Advapi32Util.registryGetKeys(WinReg.HKEY_LOCAL_MACHINE, base)){
++                    String key = base+"\\"+inst;
++                    Map<String,String> v = new HashMap<>();
++                    putIfString(v,"Service", key,"Service");
++                    putIfString(v,"FriendlyName", key,"FriendlyName");
++                    putIfString(v,"DeviceDesc", key,"DeviceDesc");
++                    // IEEE1284 vive bajo <key>\Device Parameters si existe.
++                    String dp = key+"\\Device Parameters";
++                    if(Advapi32Util.registryKeyExists(WinReg.HKEY_LOCAL_MACHINE, dp)){
++                        putIfString(v,"IEEE1284", dp,"CompatibleIDs"); // aprox; refinar con papel
++                    }
++                    reg.put(vidpid+"\\"+inst, v);
++                }
++            }
++        } catch(Exception e){ return Collections.emptyMap(); }
++        return parse(reg);
++    }
++
++    private static void putIfString(Map<String,String> v, String field, String key, String value){
++        try {
++            if(Advapi32Util.registryValueExists(WinReg.HKEY_LOCAL_MACHINE,key,value)){
++                Object o=Advapi32Util.registryGetValue(WinReg.HKEY_LOCAL_MACHINE,key,value);
++                if(o instanceof String) v.put(field,(String)o);
++            }
++        } catch(Exception ignored){}
++    }
++}
+diff --git a/test/qz/utils/WindowsUsbInfoTest.java b/test/qz/utils/WindowsUsbInfoTest.java
+new file mode 100644
+index 0000000..b94bc7b
+--- /dev/null
++++ b/test/qz/utils/WindowsUsbInfoTest.java
+@@ -0,0 +1,76 @@
++package qz.utils;
++
++import org.testng.annotations.Test;
++import java.util.*;
++
++import static org.testng.Assert.*;
++
++public class WindowsUsbInfoTest {
++    private Map<String,String> vals(String... kv){
++        Map<String,String> m=new HashMap<>();
++        for(int i=0;i<kv.length;i+=2) m.put(kv[i],kv[i+1]);
++        return m;
++    }
++
++    @Test public void pos58_usbprint_instance_PRINTER(){
++        Map<String,Map<String,String>> reg=new HashMap<>();
++        reg.put("VID_0416&PID_5011\\PRINTER",
++            vals("Service","usbprint","FriendlyName","GD32 Microelectronics POS58 USB Printer"));
++        Map<String,WindowsUsbInfo.DeviceInfo> out=WindowsUsbInfo.parse(reg);
++        WindowsUsbInfo.DeviceInfo d=out.get("0416:5011");
++        assertNotNull(d);
++        assertEquals(d.printerClass,"usbprint");
++        assertEquals(d.friendlyName,"GD32 Microelectronics POS58 USB Printer");
++        assertEquals(d.devicePath,"\\\\.\\USB#VID_0416&PID_5011#PRINTER#{28d78fad-5a12-11d1-ae5b-0000f803a8c2}\\dummy");
++    }
++
++    @Test public void pos80_usbprint_instance_serial(){
++        Map<String,Map<String,String>> reg=new HashMap<>();
++        reg.put("VID_1FC9&PID_2016\\702D07693632",
++            vals("Service","usbprint","FriendlyName","Printer POS-80"));
++        WindowsUsbInfo.DeviceInfo d=WindowsUsbInfo.parse(reg).get("1fc9:2016");
++        assertEquals(d.devicePath,"\\\\.\\USB#VID_1FC9&PID_2016#702D07693632#{28d78fad-5a12-11d1-ae5b-0000f803a8c2}\\dummy");
++    }
++
++    @Test public void epson_tmusb_no_devicePath(){
++        Map<String,Map<String,String>> reg=new HashMap<>();
++        reg.put("VID_04B8&PID_0202\\J4FF025969",
++            vals("Service","TMUSB","FriendlyName","EPSON USB Controller for TM/BA/EU Printers"));
++        WindowsUsbInfo.DeviceInfo d=WindowsUsbInfo.parse(reg).get("04b8:0202");
++        assertNotNull(d);                       // se detecta (útil para el badge "por cola")
++        assertEquals(d.printerClass,"TMUSB");
++        assertNull(d.devicePath);               // TMUSB no es usbprint → sin path directo
++    }
++
++    @Test public void non_printer_omitted(){
++        Map<String,Map<String,String>> reg=new HashMap<>();
++        reg.put("VID_0C45&PID_6728\\5&ab&0",
++            vals("Service","usbvideo","FriendlyName","USB Camera"));
++        assertNull(WindowsUsbInfo.parse(reg).get("0c45:6728"));  // webcam, no impresora
++    }
++
++    @Test public void toJson_addsFields() throws Exception {
++        WindowsUsbInfo.DeviceInfo d=new WindowsUsbInfo.DeviceInfo();
++        d.printerClass="usbprint"; d.friendlyName="Printer POS-80";
++        d.devicePath="\\\\.\\USB#VID_1FC9&PID_2016#702D07693632#{28d78fad-5a12-11d1-ae5b-0000f803a8c2}\\dummy";
++        org.codehaus.jettison.json.JSONObject o=new org.codehaus.jettison.json.JSONObject();
++        WindowsUsbInfo.applyTo(o, d);
++        assertEquals(o.getString("printerClass"), "usbprint");
++        assertEquals(o.getString("friendlyName"), "Printer POS-80");
++        assertTrue(o.getString("devicePath").contains("702D07693632"));
++    }
++
++    @Test public void resolvePort_null_when_unknown(){
++        Map<String,WindowsUsbInfo.DeviceInfo> info=new HashMap<>();
++        assertNull(WindowsUsbInfo.resolvePortToDevice("USB999", info));
++    }
++
++    @Test public void resolvePort_matches_by_devicePath_port(){
++        WindowsUsbInfo.DeviceInfo d=new WindowsUsbInfo.DeviceInfo();
++        d.vendorId="1fc9"; d.productId="2016"; d.friendlyName="Printer POS-80"; d.usbPort="USB001";
++        Map<String,WindowsUsbInfo.DeviceInfo> info=new HashMap<>();
++        info.put("1fc9:2016", d);
++        WindowsUsbInfo.DeviceInfo r=WindowsUsbInfo.resolvePortToDevice("USB001", info);
++        assertNotNull(r); assertEquals(r.vendorId, "1fc9");
++    }
++}

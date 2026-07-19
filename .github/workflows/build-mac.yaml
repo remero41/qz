@@ -63,6 +63,15 @@ jobs:
           git checkout "$QZ_SOURCE_REF"
           echo "Fuente en $(git rev-parse --short HEAD)"
 
+      # 2b) Aplicar el parche de device path USB Windows (aditivo; el código nuevo
+      #     es Windows-only en runtime, así que compila igual en el build de Mac).
+      - name: Aplicar parche device path Windows
+        working-directory: tray
+        run: |
+          git apply --check ../this-repo/patches/0001-usb-details-windows-devicepath.patch
+          git apply        ../this-repo/patches/0001-usb-details-windows-devicepath.patch
+          echo "Parche device path aplicado."
+
       # 3) Copiar el provisioning versionado en nuestro repo dentro del arbol tray.
       - name: Colocar provisioning
         run: |
