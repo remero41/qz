@@ -58,10 +58,10 @@ index 93466d6..c9b3669 100644
  
 diff --git a/src/qz/utils/WindowsUsbInfo.java b/src/qz/utils/WindowsUsbInfo.java
 new file mode 100644
-index 0000000..c94d2ce
+index 0000000..b767a2e
 --- /dev/null
 +++ b/src/qz/utils/WindowsUsbInfo.java
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,189 @@
 +package qz.utils;
 +
 +import java.util.*;
@@ -128,12 +128,12 @@ index 0000000..c94d2ce
 +            d.vendorId=vid.toLowerCase(); d.productId=pid.toLowerCase();
 +            d.printerClass=service; d.ieee1284=ieee;
 +            d.friendlyName=v.getOrDefault("FriendlyName", v.get("DeviceDesc"));
-+            // usbPort (cruce cola↔dispositivo para printers.details): HOY queda null.
-+            // El "Port" de spooler ("USB001") NO vive bajo Enum\USB\...\instance, sino
-+            // en Control\Print\Printers\<cola>\Port → resolvePortToDevice devuelve null
-+            // y details NO se enriquece. NO se usa para el USB directo (ese path lo da
-+            // listDevices, no details). PENDIENTE si se quiere el select por cola.
-+            d.usbPort=v.get("Port"); // siempre null hoy (no hay "Port" en este subárbol)
++            // usbPort ("USB001") = cruce cola↔dispositivo para printers.details.
++            // readRegistry lo puebla vía ParentIdPrefix → Enum\USBPRINT\...\PortName.
++            // resolvePortToDevice(printer.getConnection()) casa por aquí y enriquece la
++            // cola con devicePath/vid/pid. Impresoras sin puerto USBnnn (Epson TMUSB en
++            // ESDPRT001) → usbPort=null → esa cola va por nombre (correcto).
++            d.usbPort=v.get("Port");
 +            boolean usbprint = service!=null && service.equalsIgnoreCase("usbprint");
 +            d.devicePath = usbprint ? buildDevicePath(vid,pid,instanceId) : null;
 +            out.put(d.vendorId+":"+d.productId, d);
@@ -158,9 +158,39 @@ index 0000000..c94d2ce
 +    }
 +
 +    private static final String ENUM_USB = "SYSTEM\\CurrentControlSet\\Enum\\USB";
++    private static final String ENUM_USBPRINT = "SYSTEM\\CurrentControlSet\\Enum\\USBPRINT";
 +
 +    private static final org.apache.logging.log4j.Logger log =
 +            org.apache.logging.log4j.LogManager.getLogger(WindowsUsbInfo.class);
++
++    /** Mapea ParentIdPrefix -> Port ("USB001") leyendo
++     *  Enum\USBPRINT\<model>\<node>\Device Parameters\PortName. El <node> es
++     *  "<ParentIdPrefix>&<Port>", y como ParentIdPrefix YA contiene '&', el prefijo
++     *  se saca quitando el sufijo "&"+Port (NO partiendo por el último '&'). */
++    private static Map<String,String> readUsbprintPorts(){
++        Map<String,String> prefixToPort = new HashMap<>();
++        try {
++            for(String model : Advapi32Util.registryGetKeys(WinReg.HKEY_LOCAL_MACHINE, ENUM_USBPRINT)){
++                String mbase = ENUM_USBPRINT+"\\"+model;
++                String[] nodes;
++                try { nodes = Advapi32Util.registryGetKeys(WinReg.HKEY_LOCAL_MACHINE, mbase); }
++                catch(Exception e){ log.warn("WindowsUsbInfo: no puedo leer nodos de USBPRINT\\{}: {}", model, e.toString()); continue; }
++                for(String node : nodes){
++                    String dp = mbase+"\\"+node+"\\Device Parameters";
++                    Map<String,String> tmp = new HashMap<>();
++                    putIfString(tmp, "PortName", dp, "PortName");
++                    String port = tmp.get("PortName");
++                    if(port == null) continue;
++                    String suffix = "&"+port;
++                    String prefix = node.endsWith(suffix) ? node.substring(0, node.length()-suffix.length()) : node;
++                    prefixToPort.put(prefix, port);
++                }
++            }
++        } catch(Exception e){
++            log.warn("WindowsUsbInfo: no puedo leer Enum\\USBPRINT (cruce cola↔dispositivo): {}", e.toString());
++        }
++        return prefixToPort;
++    }
 +
 +    /** Lee el registro USB de Windows y produce el mapa "vvvv:pppp"→DeviceInfo.
 +     *  Devuelve {} si no es Windows o ante cualquier error (fail-safe: TPV degrada a cola). */
@@ -169,6 +199,8 @@ index 0000000..c94d2ce
 +        Map<String,Map<String,String>> reg = new HashMap<>();
 +        int topKeys = 0, instKeys = 0;
 +        try {
++            // Cruce cola↔dispositivo: ParentIdPrefix → Port ("USB001"). Se lee UNA vez.
++            Map<String,String> prefixToPort = readUsbprintPorts();
 +            String[] vidpids = Advapi32Util.registryGetKeys(WinReg.HKEY_LOCAL_MACHINE, ENUM_USB);
 +            topKeys = vidpids.length;
 +            for(String vidpid : vidpids){
@@ -187,6 +219,13 @@ index 0000000..c94d2ce
 +                    String dp = key+"\\Device Parameters";
 +                    if(Advapi32Util.registryKeyExists(WinReg.HKEY_LOCAL_MACHINE, dp)){
 +                        putIfString(v,"IEEE1284", dp,"CompatibleIDs"); // aprox; refinar con papel
++                    }
++                    // Port de spooler ("USB001") vía ParentIdPrefix → Enum\USBPRINT.
++                    putIfString(v,"ParentIdPrefix", key,"ParentIdPrefix");
++                    String pip = v.get("ParentIdPrefix");
++                    if(pip != null){
++                        String port = prefixToPort.get(pip);
++                        if(port != null) v.put("Port", port); // parse() hace d.usbPort = v.get("Port")
 +                    }
 +                    reg.put(vidpid+"\\"+inst, v);
 +                }
@@ -214,10 +253,10 @@ index 0000000..c94d2ce
 +}
 diff --git a/test/qz/utils/WindowsUsbInfoTest.java b/test/qz/utils/WindowsUsbInfoTest.java
 new file mode 100644
-index 0000000..b94bc7b
+index 0000000..fb6b15c
 --- /dev/null
 +++ b/test/qz/utils/WindowsUsbInfoTest.java
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,84 @@
 +package qz.utils;
 +
 +import org.testng.annotations.Test;
@@ -292,5 +331,13 @@ index 0000000..b94bc7b
 +        info.put("1fc9:2016", d);
 +        WindowsUsbInfo.DeviceInfo r=WindowsUsbInfo.resolvePortToDevice("USB001", info);
 +        assertNotNull(r); assertEquals(r.vendorId, "1fc9");
++    }
++
++    @Test public void parse_populates_usbPort_from_Port(){
++        Map<String,Map<String,String>> reg=new HashMap<>();
++        reg.put("VID_1FC9&PID_2016\\702D07693632",
++            vals("Service","usbprint","FriendlyName","Printer POS-80","Port","USB003"));
++        WindowsUsbInfo.DeviceInfo d=WindowsUsbInfo.parse(reg).get("1fc9:2016");
++        assertEquals(d.usbPort,"USB003");
 +    }
 +}
