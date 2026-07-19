@@ -1,5 +1,12 @@
 [
   {
+    "description": "Permitir impresion directa a device path (USB directo por {file}) — sin esto QZ lanza 'not permitted'",
+    "type": "property",
+    "phase": "certgen",
+    "os": "*",
+    "data": "security.print.tofile=true"
+  },
+  {
     "description": "Arranque blindado QZ (tarea + watchdog)",
     "type": "Script",
     "phase": "install",
