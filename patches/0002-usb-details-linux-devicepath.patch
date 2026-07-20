@@ -1,9 +1,9 @@
 diff --git a/src/qz/utils/LinuxUsbInfo.java b/src/qz/utils/LinuxUsbInfo.java
 new file mode 100644
-index 0000000..7b1fb77
+index 0000000..b5be7c1
 --- /dev/null
 +++ b/src/qz/utils/LinuxUsbInfo.java
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,148 @@
 +package qz.utils;
 +
 +import java.util.*;
@@ -88,21 +88,37 @@ index 0000000..7b1fb77
 +    /** Lee sysfs de verdad. Defensivo: un nodo ilegible se omite (log.warn), nunca lanza. */
 +    public static Map<String,DeviceInfo> readSysfs(){
 +        if(!SystemUtilities.isLinux()) return Collections.emptyMap();
++        return readSysfsFrom(Paths.get(USBMISC));
++    }
++
++    // Campos que viven en el DISPOSITIVO USB (no en la interfaz): hay que subir
++    // desde `device` (que apunta a la interfaz, p.ej. 3-3:1.0) hacia el padre 3-3.
++    private static final String[] DEVICE_FIELDS = {"idVendor","idProduct","serial","product","manufacturer"};
++    // Cuántos niveles subir como máximo buscando el device con idVendor.
++    private static final int MAX_PARENTS = 6;
++
++    /** Como readSysfs pero con base parametrizable (testeable con un /sys de fixture).
++     *  GOTCHA sysfs real: `/sys/class/usbmisc/lpN/device` es un symlink a la INTERFAZ
++     *  (3-3:1.0), donde vive `ieee1284_id`; pero `idVendor/idProduct/serial/product`
++     *  viven en el DISPOSITIVO PADRE (3-3). Por eso se resuelve el symlink y se sube
++     *  hasta encontrar `idVendor`. (Bug 2026-07-20: sin subir, vid/pid salían vacíos
++     *  y el dispositivo se descartaba → TPV imprimía por cola pese al "directo".) */
++    public static Map<String,DeviceInfo> readSysfsFrom(Path base){
 +        Map<String,Map<String,String>> raw=new HashMap<>();
 +        try {
-+            Path base=Paths.get(USBMISC);
 +            if(!Files.isDirectory(base)) return Collections.emptyMap();
 +            try(DirectoryStream<Path> ds=Files.newDirectoryStream(base,"lp*")){
 +                for(Path lp: ds){
 +                    try {
-+                        Path dev=lp.resolve("device");
++                        Path iface = lp.resolve("device").toRealPath();   // la interfaz USB
++                        Path usbDev = resolveUsbDevice(iface);            // sube al dispositivo con idVendor
 +                        Map<String,String> m=new HashMap<>();
-+                        for(String f: new String[]{"idVendor","idProduct","serial","ieee1284_id","product","manufacturer"}){
-+                            Path fp=dev.resolve(f);
-+                            if(Files.isReadable(fp)){
-+                                m.put(f, new String(Files.readAllBytes(fp)).trim());
-+                            }
++                        // vid/pid/serial/product/manufacturer desde el DISPOSITIVO
++                        if(usbDev!=null){
++                            for(String f: DEVICE_FIELDS){ readField(usbDev, f, m); }
 +                        }
++                        // ieee1284_id desde la INTERFAZ (ahí lo publica usblp)
++                        readField(iface, "ieee1284_id", m);
 +                        raw.put(lp.getFileName().toString(), m);
 +                    } catch(Exception ex){
 +                        log.warn("LinuxUsbInfo: nodo {} ilegible: {}", lp, ex.toString());
@@ -110,10 +126,30 @@ index 0000000..7b1fb77
 +                }
 +            }
 +        } catch(Exception e){
-+            log.warn("LinuxUsbInfo: no puedo leer {}: {}", USBMISC, e.toString());
++            log.warn("LinuxUsbInfo: no puedo leer {}: {}", base, e.toString());
 +            return Collections.emptyMap();
 +        }
 +        return parse(raw);
++    }
++
++    /** Sube desde la interfaz hacia los padres hasta encontrar el nodo con `idVendor`
++     *  (el dispositivo USB real). Devuelve null si no aparece en MAX_PARENTS niveles. */
++    private static Path resolveUsbDevice(Path iface){
++        Path p = iface;
++        for(int i=0; i<MAX_PARENTS && p!=null; i++){
++            if(Files.isReadable(p.resolve("idVendor"))) return p;
++            p = p.getParent();
++        }
++        return null;
++    }
++
++    private static void readField(Path dir, String f, Map<String,String> m){
++        try {
++            Path fp = dir.resolve(f);
++            if(Files.isReadable(fp)){
++                m.put(f, new String(Files.readAllBytes(fp)).trim());
++            }
++        } catch(Exception ignored){}
 +    }
 +}
 diff --git a/src/qz/utils/UsbUtilities.java b/src/qz/utils/UsbUtilities.java
@@ -176,10 +212,10 @@ index b767a2e..326cbcd 100644
      private static final String ENUM_USB = "SYSTEM\\CurrentControlSet\\Enum\\USB";
 diff --git a/test/qz/utils/LinuxUsbInfoTest.java b/test/qz/utils/LinuxUsbInfoTest.java
 new file mode 100644
-index 0000000..a7bdd07
+index 0000000..2677447
 --- /dev/null
 +++ b/test/qz/utils/LinuxUsbInfoTest.java
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,112 @@
 +package qz.utils;
 +import org.testng.annotations.Test;
 +import java.util.*;
@@ -244,6 +280,52 @@ index 0000000..a7bdd07
 +        String key=(dev.getString("vendorId")+":"+dev.getString("productId")).toLowerCase().replace("0x","");
 +        LinuxUsbInfo.applyTo(dev, info.get(key));
 +        assertEquals(dev.getString("devicePath"),"/dev/usb/lp2");
++    }
++
++    // REPRODUCE bug real (POS80 en Linux 2026-07-20): el symlink `device` de
++    // /sys/class/usbmisc/lpN apunta a la INTERFAZ (3-3:1.0), no al dispositivo.
++    // idVendor/idProduct/serial/product viven en el DISPOSITIVO PADRE (3-3);
++    // solo ieee1284_id está en la interfaz. readSysfs debe subir al padre.
++    @Test public void readSysfs_sube_al_device_padre() throws Exception {
++        java.nio.file.Path tmp = java.nio.file.Files.createTempDirectory("usbmisc-test");
++        try {
++            // Estructura: <tmp>/class/usbmisc/lp0/device -> <tmp>/devices/usb3/3-3/3-3:1.0
++            java.nio.file.Path clazz = tmp.resolve("class/usbmisc/lp0");
++            java.nio.file.Path device = tmp.resolve("devices/usb3/3-3");          // dispositivo (padre)
++            java.nio.file.Path iface  = device.resolve("3-3:1.0");                // interfaz (destino del symlink)
++            java.nio.file.Files.createDirectories(clazz);
++            java.nio.file.Files.createDirectories(iface);
++            // vid/pid/serial/product en el DISPOSITIVO PADRE
++            write(device.resolve("idVendor"),  "1fc9");
++            write(device.resolve("idProduct"), "2016");
++            write(device.resolve("serial"),    "702D07693632");
++            write(device.resolve("product"),   "USB Printer P");
++            // ieee1284_id SOLO en la interfaz
++            write(iface.resolve("ieee1284_id"), "MFG:Printer;MDL:POS-80;CMD:ESC/POS;CLS:PRINTER;");
++            // symlink device -> interfaz (como en sysfs real)
++            java.nio.file.Files.createSymbolicLink(clazz.resolve("device"), iface);
++
++            Map<String,LinuxUsbInfo.DeviceInfo> out =
++                LinuxUsbInfo.readSysfsFrom(tmp.resolve("class/usbmisc"));
++            LinuxUsbInfo.DeviceInfo d = out.get("1fc9:2016");
++            assertNotNull(d, "debe detectar el POS80 subiendo al device padre");
++            assertEquals(d.vendorId, "1fc9");
++            assertEquals(d.productId, "2016");
++            assertEquals(d.serial, "702D07693632");
++            assertEquals(d.devicePath, "/dev/usb/lp0");
++            assertTrue(d.ieee1284.contains("ESC/POS"), "ieee1284 se lee de la interfaz");
++            assertEquals(out.get("1fc9:2016:702D07693632").devicePath, "/dev/usb/lp0");
++        } finally {
++            deleteRec(tmp.toFile());
++        }
++    }
++    private static void write(java.nio.file.Path p, String s) throws Exception {
++        java.nio.file.Files.write(p, (s+"\n").getBytes());
++    }
++    private static void deleteRec(java.io.File f){
++        java.io.File[] kids = f.listFiles();
++        if(kids!=null) for(java.io.File k: kids){ if(!java.nio.file.Files.isSymbolicLink(k.toPath())) deleteRec(k); else k.delete(); }
++        f.delete();
 +    }
 +}
 diff --git a/test/qz/utils/WindowsUsbInfoTest.java b/test/qz/utils/WindowsUsbInfoTest.java
