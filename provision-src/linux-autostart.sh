@@ -19,6 +19,22 @@ if [ ! -x "$QZ_BIN" ]; then
   exit 0
 fi
 
+# --- 0) Permitir impresion directa a device path (USB directo por {file}) ---
+# El USB directo en Linux imprime a /dev/usb/lpN via {file}, que QZ BLOQUEA por
+# defecto (security.print.tofile=false → "Printing to file is not permitted").
+# Se activa en el qz-tray.properties de SISTEMA (lo lee CertificateManager). Se
+# hace aqui (en el Script de provisioning, que SI se ejecuta en la instalacion)
+# porque la entrada "property" del provision.json no se aplicaba con makeself.
+QZ_PROPS="/opt/qz-tray/qz-tray.properties"
+if [ -f "$QZ_PROPS" ]; then
+  if grep -q '^security.print.tofile=' "$QZ_PROPS" 2>/dev/null; then
+    sed -i 's/^security.print.tofile=.*/security.print.tofile=true/' "$QZ_PROPS"
+  else
+    printf '\nsecurity.print.tofile=true\n' >> "$QZ_PROPS"
+  fi
+  echo "security.print.tofile=true escrito en $QZ_PROPS (USB directo por device path habilitado)."
+fi
+
 # Usuario objetivo: el que invocó sudo (instalación gráfica real), no root.
 TARGET_USER="${SUDO_USER:-$USER}"
 TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
