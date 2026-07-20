@@ -19,11 +19,23 @@ if [ ! -x "$QZ_BIN" ]; then
   exit 0
 fi
 
-# NOTA: la escritura de security.print.tofile se hace mas abajo, en el
-# prefs.properties del USUARIO (tras resolver TARGET_HOME). NO se escribe en el
-# qz-tray.properties de /opt porque QZ lo REGENERA al arrancar (saveProperties tras
-# crear los keystores SSL) y borra la linea. El prefs.properties de usuario, en
-# cambio, QZ no lo sobrescribe.
+# --- 0) Permitir impresion directa a device path (USB directo por {file}) ---
+# El USB directo en Linux imprime a /dev/usb/lpN via {file}, que QZ BLOQUEA por
+# defecto (security.print.tofile=false → "Printing to file is not permitted").
+# Se escribe en el qz-tray.properties de SISTEMA, que es el UNICO que QZ lee para
+# esta property (CertificateManager.loadProperties → SOLO qz-tray.properties, nunca
+# prefs.properties). QZ regenera ese fichero al arrancar, PERO el parche añadio
+# 'security.print.tofile' a PERSIST_PROPS (Constants.java), asi que ahora QZ la
+# PRESERVA entre arranques. Idempotente.
+QZ_PROPS="/opt/qz-tray/qz-tray.properties"
+if [ -f "$QZ_PROPS" ]; then
+  if grep -q '^security.print.tofile=' "$QZ_PROPS" 2>/dev/null; then
+    sed -i 's/^security.print.tofile=.*/security.print.tofile=true/' "$QZ_PROPS"
+  else
+    printf 'security.print.tofile=true\n' >> "$QZ_PROPS"
+  fi
+  echo "security.print.tofile=true escrito en $QZ_PROPS (USB directo por device path habilitado)."
+fi
 
 # Usuario objetivo: el que invocó sudo (instalación gráfica real), no root.
 TARGET_USER="${SUDO_USER:-$USER}"
@@ -32,23 +44,6 @@ if [ -z "$TARGET_HOME" ]; then
   echo "No se pudo resolver el HOME de $TARGET_USER; omitiendo."
   exit 0
 fi
-
-# --- 0) Permitir impresion directa a device path (USB directo por {file}) ---
-# El USB directo en Linux imprime a /dev/usb/lpN via {file}, que QZ BLOQUEA por
-# defecto (security.print.tofile=false → "Printing to file is not permitted").
-# Se escribe en el prefs.properties del USUARIO (QZ lo lee via PrefsSearch y NO lo
-# regenera; el qz-tray.properties de /opt SI lo reescribe QZ al arrancar y borraria
-# la linea). Idempotente.
-QZ_PREFS_DIR="$TARGET_HOME/.qz"
-QZ_PREFS="$QZ_PREFS_DIR/prefs.properties"
-mkdir -p "$QZ_PREFS_DIR"
-touch "$QZ_PREFS"
-if grep -q '^security.print.tofile=' "$QZ_PREFS" 2>/dev/null; then
-  sed -i 's/^security.print.tofile=.*/security.print.tofile=true/' "$QZ_PREFS"
-else
-  printf 'security.print.tofile=true\n' >> "$QZ_PREFS"
-fi
-chown -R "$TARGET_USER":"$TARGET_USER" "$QZ_PREFS_DIR" 2>/dev/null || true
 echo "security.print.tofile=true escrito en $QZ_PREFS (USB directo por device path habilitado)."
 
 # --- 1) Desactivar el autostart .desktop de QZ para el usuario (evita duplicado) ---

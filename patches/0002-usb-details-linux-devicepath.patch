@@ -1,3 +1,21 @@
+diff --git a/src/qz/common/Constants.java b/src/qz/common/Constants.java
+index 68ecb6b..ebc2290 100644
+--- a/src/qz/common/Constants.java
++++ b/src/qz/common/Constants.java
+@@ -25,7 +25,12 @@ public class Constants {
+     public static final String LOG_FILE = "debug";
+     public static final String PROPS_FILE = "qz-tray"; // .properties extension is assumed
+     public static final String PREFS_FILE = "prefs"; // .properties extension is assumed
+-    public static final String[] PERSIST_PROPS = {"file.whitelist", "file.allow", "networking.hostname", "networking.port", STEAL_WEBSOCKET_PROPERTY };
++    // security.print.tofile AÑADIDO al parche: sin él, QZ regenera qz-tray.properties
++    // en cada arranque (saveProperties tras crear los keystores SSL) y DESCARTA la
++    // property → el USB directo por device path ({file:/dev/usb/lpN}) siempre daba
++    // "Printing to file is not permitted". Al persistirla, el provisioning la escribe
++    // una vez y sobrevive a los reinicios.
++    public static final String[] PERSIST_PROPS = {"file.whitelist", "file.allow", "networking.hostname", "networking.port", "security.print.tofile", STEAL_WEBSOCKET_PROPERTY };
+     public static final String AUTOSTART_FILE = ".autostart";
+     public static final String DATA_DIR = "qz";
+ 
 diff --git a/src/qz/utils/LinuxUsbInfo.java b/src/qz/utils/LinuxUsbInfo.java
 new file mode 100644
 index 0000000..b5be7c1
