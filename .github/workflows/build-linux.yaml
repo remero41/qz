@@ -1,0 +1,170 @@
+# Compila el instalador .run (makeself) de QZ Tray para Linux en un runner
+# ubuntu-latest de GitHub Actions, aplicando AMBOS parches device path USB
+# (0001 Windows + 0002 Linux). El código nuevo de 0002 (LinuxUsbInfo) solo se
+# ACTIVA en runtime bajo Linux (SystemUtilities.isLinux()); en el propio build
+# es aditivo, así que compila igual con o sin él.
+#
+# Por que existe: el .run del repo se compilaba a mano. Este workflow lo hace
+# reproducible en CI para generar el .run PARCHEADO (con el /dev/usb/lpN real +
+# serial que consume el TPV vía sysfs) sin depender de una máquina Linux a mano.
+# Espeja a build-win.yaml / build-mac.yaml pero con target `makeself`.
+#
+# IMPORTANTE: este repo NO contiene el fuente de QZ, solo binarios y el
+# provisioning (provision-src/). El fuente vive en qzind/tray. El workflow:
+#   (1) checkout de ESTE repo (provision-src/ + patches/) en subcarpeta,
+#   (2) clona qzind/tray al pin exacto (46e404e),
+#   (3) aplica los patches 0001 (win) y 0002 (linux) EN ESE ORDEN,
+#   (4) corre los tests TestNG (LinuxUsbInfoTest/WindowsUsbInfoTest incluidos),
+#   (5) copia el provisioning + (opcional) los certs desde Secrets,
+#   (6) compila con `ant makeself`.
+#
+# GOTCHA out/: nsis (win) y makeself (linux) escriben en el mismo out/ del árbol;
+# NO se encadenan targets de instaladores distintos en un mismo build. Aquí solo
+# se hace makeself, así que no aplica; se documenta por si se añade otro target.
+#
+# FIRMA / CERTIFICADO QZ (authcert, confianza sin diálogo): OPCIONAL. Si están los
+# Secrets QZ_CERT_PEM/QZ_KEY_PEM/QZ_OVERRIDE_CRT se usan; si no, compila sin ellos
+# (válido para PROBAR el parche con papel; el parque ya confía en el cert instalado).
+#
+# SECRETS opcionales:
+#   QZ_CERT_PEM / QZ_KEY_PEM / QZ_OVERRIDE_CRT  -> certificado de confianza QZ
+# VARIABLE opcional: QZ_CERT_CN_MATCH -> texto que debe contener el subject del cert.
+
+name: build-linux
+
+on:
+  push:
+    branches:
+      - 'feat/usb-devicepath-linux'
+    paths:
+      - 'patches/**'
+      - '.github/workflows/build-linux.yaml'
+      - 'provision-src/**'
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Adjuntar el .run a una Release (tag)'
+        required: false
+        default: ''
+
+env:
+  QZ_SOURCE_REPO: https://github.com/qzind/tray
+  QZ_SOURCE_REF: 46e404e4d50d92b84ee3a817d29ce0f5225907bb
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      # 1) Checkout de ESTE repo (provision-src/ + patches/) en subcarpeta.
+      - uses: actions/checkout@v4
+        with:
+          path: this-repo
+
+      # Java 11 (liberica), igual que build-win/mac: javac.source/target=11.
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'liberica'
+
+      # makeself para empaquetar el .run autoextraíble.
+      - name: Instalar herramientas
+        run: sudo apt-get update && sudo apt-get install -y ant makeself
+
+      # 2) Clonar el fuente de QZ al pin exacto (qzind/tray @ 46e404e).
+      - name: Clonar fuente qzind/tray (pin exacto)
+        run: |
+          git clone --filter=blob:none "$QZ_SOURCE_REPO" tray
+          cd tray
+          git checkout "$QZ_SOURCE_REF"
+          echo "Fuente en $(git rev-parse --short HEAD)"
+
+      # 2b) Aplicar los parches EN ORDEN: 0001 (win) primero, 0002 (linux) después.
+      #     0002 fue generado sobre "pin + 0001", así que este orden es obligatorio.
+      - name: Aplicar parches device path (windows + linux)
+        working-directory: tray
+        run: |
+          git apply --check ../this-repo/patches/0001-usb-details-windows-devicepath.patch
+          git apply        ../this-repo/patches/0001-usb-details-windows-devicepath.patch
+          git apply --check ../this-repo/patches/0002-usb-details-linux-devicepath.patch
+          git apply        ../this-repo/patches/0002-usb-details-linux-devicepath.patch
+          echo "Parches 0001 (win) + 0002 (linux) aplicados."
+
+      # 3) Tests TestNG (incluye LinuxUsbInfoTest y WindowsUsbInfoTest).
+      - name: Tests TestNG
+        working-directory: tray
+        run: ant unit-tests
+
+      # 4) Copiar el provisioning versionado dentro del árbol tray.
+      - name: Colocar provisioning
+        run: |
+          mkdir -p tray/provision
+          cp this-repo/provision-src/*.ps1 this-repo/provision-src/*.sh this-repo/provision-src/provision.json tray/provision/ 2>/dev/null || true
+          ls -la tray/provision/ || true
+
+      # 5) Certificado de confianza QZ (OPCIONAL).
+      - name: Restaurar certificados de confianza (si hay Secrets)
+        id: authcert
+        env:
+          QZ_CERT_PEM: ${{ secrets.QZ_CERT_PEM }}
+          QZ_KEY_PEM: ${{ secrets.QZ_KEY_PEM }}
+          QZ_OVERRIDE_CRT: ${{ secrets.QZ_OVERRIDE_CRT }}
+          QZ_CERT_CN_MATCH: ${{ vars.QZ_CERT_CN_MATCH }}
+        run: |
+          if [ -n "$QZ_CERT_PEM" ] && [ -n "$QZ_KEY_PEM" ] && [ -n "$QZ_OVERRIDE_CRT" ]; then
+            printf '%s' "$QZ_CERT_PEM"     > tray/cert.pem
+            printf '%s' "$QZ_KEY_PEM"      > tray/key.pem
+            printf '%s' "$QZ_OVERRIDE_CRT" > tray/override.crt
+            chmod 600 tray/key.pem
+            if [ -n "$QZ_CERT_CN_MATCH" ]; then
+              openssl x509 -in tray/cert.pem -noout -subject 2>/dev/null | grep -q "$QZ_CERT_CN_MATCH" \
+                || { echo "::error::cert.pem no coincide con QZ_CERT_CN_MATCH."; exit 1; }
+            fi
+            echo "authcert=cert.pem" >> "$GITHUB_OUTPUT"
+            echo "Certificado de confianza QZ restaurado."
+          else
+            echo "authcert=" >> "$GITHUB_OUTPUT"
+            echo "Sin Secrets de cert QZ: se compila sin authcert (por defecto)."
+          fi
+
+      # 6) Compilar el instalador .run (target makeself).
+      - name: Compilar instalador .run (makeself)
+        working-directory: tray
+        run: |
+          ARGS=(-Dprovision.file=provision/provision.json)
+          if [ -n "${{ steps.authcert.outputs.authcert }}" ]; then
+            ARGS+=(-Dauthcert.use=cert.pem)
+          fi
+          echo "ant makeself ${ARGS[*]}"
+          ant makeself "${ARGS[@]}"
+          ls -la out/*.run
+
+      # Nombre FIJO qz.run: makeself genera el .run con la version dentro del
+      # nombre (qz-tray-X.Y.Z.run), asi que la URL de descarga cambiaria en cada
+      # release. Renombrando a qz.run, el enlace
+      # .../releases/latest/download/qz.run es estable y no hay que tocar el TPV
+      # al publicar una version nueva.
+      - name: Renombrar instalador a qz.run
+        working-directory: tray
+        run: |
+          SRC=$(ls out/*.run | head -1)
+          [ -n "$SRC" ] || { echo "::error::no se genero ningun .run"; exit 1; }
+          [ "$SRC" = "out/qz.run" ] || mv "$SRC" out/qz.run
+          ls -la out/qz.run
+
+      - name: Limpiar secretos del workspace
+        if: always()
+        run: rm -f tray/cert.pem tray/key.pem tray/override.crt
+
+      - name: Subir artefacto (.run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: qz-tray-linux
+          path: tray/out/qz.run
+          if-no-files-found: error
+
+      - name: Adjuntar a Release
+        if: ${{ inputs.release != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release }}
+          files: tray/out/qz.run

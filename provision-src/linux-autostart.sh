@@ -19,6 +19,24 @@ if [ ! -x "$QZ_BIN" ]; then
   exit 0
 fi
 
+# --- 0) Permitir impresion directa a device path (USB directo por {file}) ---
+# El USB directo en Linux imprime a /dev/usb/lpN via {file}, que QZ BLOQUEA por
+# defecto (security.print.tofile=false → "Printing to file is not permitted").
+# Se escribe en el qz-tray.properties de SISTEMA, que es el UNICO que QZ lee para
+# esta property (CertificateManager.loadProperties → SOLO qz-tray.properties, nunca
+# prefs.properties). QZ regenera ese fichero al arrancar, PERO el parche añadio
+# 'security.print.tofile' a PERSIST_PROPS (Constants.java), asi que ahora QZ la
+# PRESERVA entre arranques. Idempotente.
+QZ_PROPS="/opt/qz-tray/qz-tray.properties"
+if [ -f "$QZ_PROPS" ]; then
+  if grep -q '^security.print.tofile=' "$QZ_PROPS" 2>/dev/null; then
+    sed -i 's/^security.print.tofile=.*/security.print.tofile=true/' "$QZ_PROPS"
+  else
+    printf 'security.print.tofile=true\n' >> "$QZ_PROPS"
+  fi
+  echo "security.print.tofile=true escrito en $QZ_PROPS (USB directo por device path habilitado)."
+fi
+
 # Usuario objetivo: el que invocó sudo (instalación gráfica real), no root.
 TARGET_USER="${SUDO_USER:-$USER}"
 TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
@@ -26,6 +44,7 @@ if [ -z "$TARGET_HOME" ]; then
   echo "No se pudo resolver el HOME de $TARGET_USER; omitiendo."
   exit 0
 fi
+echo "security.print.tofile=true escrito en $QZ_PREFS (USB directo por device path habilitado)."
 
 # --- 1) Desactivar el autostart .desktop de QZ para el usuario (evita duplicado) ---
 # Se hace enmascarándolo con un .desktop "Hidden=true" en el autostart DEL USUARIO,

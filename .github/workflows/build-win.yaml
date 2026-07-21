@@ -1,0 +1,196 @@
+# Compila el instalador .exe de QZ Tray para Windows en un runner windows-latest
+# de GitHub Actions, aplicando el parche device path USB (patches/0001-...).
+#
+# Por que existe: el .exe del repo se compilaba a mano en una maquina Windows.
+# Este workflow lo hace reproducible en CI para poder generar el .exe PARCHEADO
+# (con el devicePath usbprint real que consume el TPV) sin depender de un Windows
+# a mano. Espeja a build-mac.yaml pero con target `nsis` (NSIS) en vez de `pkgbuild`.
+#
+# IMPORTANTE: este repo NO contiene el fuente de QZ, solo binarios y el
+# provisioning (provision-src/). El fuente vive en qzind/tray. El workflow:
+#   (1) checkout de ESTE repo (provision-src/ + patches/),
+#   (2) clona qzind/tray al pin exacto (46e404e),
+#   (3) aplica el parche device path,
+#   (4) copia el provisioning + (opcional) los certs desde Secrets,
+#   (5) compila con `ant nsis`.
+#
+# Disparo: se lanza en cada push de la rama del parche (para compilar el .exe al
+# subir), y ademas MANUALMENTE (workflow_dispatch) para adjuntarlo a una Release.
+#
+# FIRMA:
+#   - Certificado QZ (authcert, confianza sin dialogo): OPCIONAL. Si estan los
+#     Secrets QZ_CERT_PEM/QZ_KEY_PEM/QZ_OVERRIDE_CRT se usan; si no, compila sin
+#     ellos (el parque ya confia en el cert instalado).
+#   - Firma Authenticode del instalador (jsign): si NO se dan Secrets de keystore,
+#     ant genera un keystore self-signed automaticamente (find-keystore-self). El
+#     .exe sale self-signed: valido para PROBAR el parche con papel (Windows pedira
+#     confirmar en la instalacion). Para produccion, define los Secrets de firma.
+#
+# SECRETS opcionales:
+#   QZ_CERT_PEM / QZ_KEY_PEM / QZ_OVERRIDE_CRT  -> certificado de confianza QZ
+#   WIN_SIGNING_KEYSTORE_B64                    -> keystore (.p12/.jks) en base64
+#   WIN_SIGNING_ALIAS / WIN_SIGNING_STOREPASS   -> alias y passphrase del keystore
+
+name: build-win
+
+on:
+  push:
+    branches:
+      - 'feat/usb-devicepath-windows'
+    paths:
+      - 'patches/**'
+      - '.github/workflows/build-win.yaml'
+      - 'provision-src/**'
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Adjuntar el .exe a una Release (tag)'
+        required: false
+        default: ''
+
+env:
+  QZ_SOURCE_REPO: https://github.com/qzind/tray
+  QZ_SOURCE_REF: 46e404e4d50d92b84ee3a817d29ce0f5225907bb
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      # 1) Checkout de ESTE repo (provision-src/ + patches/) en subcarpeta.
+      - uses: actions/checkout@v4
+        with:
+          path: this-repo
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'liberica'
+
+      # NSIS: ant lo busca en "C:\Program Files (x86)\NSIS\makensis.exe",
+      # que es justo donde lo deja choco.
+      - name: Instalar NSIS
+        run: choco install nsis -y --no-progress
+
+      # 2) Clonar el fuente de QZ al pin exacto (qzind/tray @ 46e404e).
+      - name: Clonar fuente qzind/tray (pin exacto)
+        shell: bash
+        run: |
+          git clone --filter=blob:none "$QZ_SOURCE_REPO" tray
+          cd tray
+          git checkout "$QZ_SOURCE_REF"
+          echo "Fuente en $(git rev-parse --short HEAD)"
+
+      # 2b) Aplicar el parche device path USB Windows.
+      - name: Aplicar parche device path Windows
+        shell: bash
+        working-directory: tray
+        run: |
+          git apply --check ../this-repo/patches/0001-usb-details-windows-devicepath.patch
+          git apply        ../this-repo/patches/0001-usb-details-windows-devicepath.patch
+          echo "Parche device path aplicado."
+
+      # 3) Copiar el provisioning versionado dentro del arbol tray.
+      - name: Colocar provisioning
+        shell: bash
+        run: |
+          mkdir -p tray/provision
+          cp this-repo/provision-src/*.ps1 this-repo/provision-src/*.sh this-repo/provision-src/provision.json tray/provision/ 2>/dev/null || true
+          ls -la tray/provision/ || true
+
+      # 4) Certificado de confianza QZ (OPCIONAL). Si estan los tres Secrets, se
+      #    restauran y se pasa -Dauthcert.use; si no, se compila sin ellos.
+      - name: Restaurar certificados de confianza (si hay Secrets)
+        id: authcert
+        shell: bash
+        env:
+          QZ_CERT_PEM: ${{ secrets.QZ_CERT_PEM }}
+          QZ_KEY_PEM: ${{ secrets.QZ_KEY_PEM }}
+          QZ_OVERRIDE_CRT: ${{ secrets.QZ_OVERRIDE_CRT }}
+        run: |
+          if [ -n "$QZ_CERT_PEM" ] && [ -n "$QZ_KEY_PEM" ] && [ -n "$QZ_OVERRIDE_CRT" ]; then
+            printf '%s' "$QZ_CERT_PEM"     > tray/cert.pem
+            printf '%s' "$QZ_KEY_PEM"      > tray/key.pem
+            printf '%s' "$QZ_OVERRIDE_CRT" > tray/override.crt
+            echo "authcert=cert.pem" >> "$GITHUB_OUTPUT"
+            echo "Certificado de confianza QZ restaurado."
+          else
+            echo "authcert=" >> "$GITHUB_OUTPUT"
+            echo "Sin Secrets de cert QZ: se compila sin authcert (self / por defecto)."
+          fi
+
+      # 4b) Keystore de firma Authenticode (OPCIONAL). Si no hay, ant autogenera
+      #     uno self-signed (find-keystore-self) y el .exe sale self-signed.
+      - name: Restaurar keystore de firma (si hay Secret)
+        id: signkeystore
+        shell: bash
+        env:
+          WIN_SIGNING_KEYSTORE_B64: ${{ secrets.WIN_SIGNING_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$WIN_SIGNING_KEYSTORE_B64" ]; then
+            echo "$WIN_SIGNING_KEYSTORE_B64" | base64 -d > tray/signing.p12
+            echo "have=1" >> "$GITHUB_OUTPUT"
+            echo "Keystore de firma restaurado."
+          else
+            echo "have=0" >> "$GITHUB_OUTPUT"
+            echo "Sin keystore de firma: el .exe saldra SELF-SIGNED (valido para probar)."
+          fi
+
+      # 5) Compilar el instalador .exe (target nsis). Se anaden -Dauthcert.use y
+      #    los -Dsigning.* solo cuando hay Secrets; si no, ant usa los defaults
+      #    (self-signed) sin fallar.
+      - name: Compilar instalador .exe
+        shell: bash
+        working-directory: tray
+        run: |
+          # Ruta explicita a makensis.exe: la deteccion de ant (nsisbin-from-64)
+          # depende de %ProgramFiles(x86)% y falla en el runner (cae a "makensis"
+          # pelado, que no esta en PATH). -Dnsisbin gana sobre la <property>.
+          NSIS_EXE="/c/Program Files (x86)/NSIS/makensis.exe"
+          if [ ! -f "$NSIS_EXE" ]; then NSIS_EXE="/c/Program Files/NSIS/makensis.exe"; fi
+          echo "makensis: $NSIS_EXE"; [ -f "$NSIS_EXE" ] || { echo "::error::makensis.exe no encontrado"; exit 1; }
+          NSIS_WIN=$(cygpath -w "$NSIS_EXE")
+          # Array para preservar los espacios de la ruta de makensis como UN arg.
+          ARGS=(-Dprovision.file=provision/provision.json "-Dnsisbin=$NSIS_WIN")
+          if [ -n "${{ steps.authcert.outputs.authcert }}" ]; then
+            ARGS+=(-Dauthcert.use=cert.pem)
+          fi
+          if [ "${{ steps.signkeystore.outputs.have }}" = "1" ]; then
+            ARGS+=(-Dsigning.keystore=signing.p12 "-Dsigning.alias=${{ secrets.WIN_SIGNING_ALIAS }}" "-Dsigning.storepass=${{ secrets.WIN_SIGNING_STOREPASS }}")
+          fi
+          echo "ant nsis ${ARGS[*]}"
+          ant nsis "${ARGS[@]}"
+          ls -la out/*.exe
+
+      # Nombre FIJO qz.exe: NSIS genera el .exe con la version dentro del nombre
+      # (qz-tray-X.Y.Z.exe), asi que la URL de descarga cambiaria en cada
+      # release. Renombrando a qz.exe, el enlace
+      # .../releases/latest/download/qz.exe es estable y no hay que tocar el TPV
+      # al publicar una version nueva.
+      - name: Renombrar instalador a qz.exe
+        working-directory: tray
+        shell: bash
+        run: |
+          SRC=$(ls out/*.exe | head -1)
+          [ -n "$SRC" ] || { echo "::error::no se genero ningun .exe"; exit 1; }
+          [ "$SRC" = "out/qz.exe" ] || mv "$SRC" out/qz.exe
+          ls -la out/qz.exe
+
+      # No dejar secretos en el workspace.
+      - name: Limpiar secretos del workspace
+        if: always()
+        shell: bash
+        run: rm -f tray/cert.pem tray/key.pem tray/override.crt tray/signing.p12
+
+      - name: Subir artefacto (.exe)
+        uses: actions/upload-artifact@v4
+        with:
+          name: qz-tray-windows
+          path: tray/out/qz.exe
+          if-no-files-found: error
+
+      - name: Adjuntar a Release
+        if: ${{ inputs.release != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release }}
+          files: tray/out/qz.exe

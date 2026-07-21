@@ -1,0 +1,365 @@
+diff --git a/src/qz/common/Constants.java b/src/qz/common/Constants.java
+index 68ecb6b..ebc2290 100644
+--- a/src/qz/common/Constants.java
++++ b/src/qz/common/Constants.java
+@@ -25,7 +25,12 @@ public class Constants {
+     public static final String LOG_FILE = "debug";
+     public static final String PROPS_FILE = "qz-tray"; // .properties extension is assumed
+     public static final String PREFS_FILE = "prefs"; // .properties extension is assumed
+-    public static final String[] PERSIST_PROPS = {"file.whitelist", "file.allow", "networking.hostname", "networking.port", STEAL_WEBSOCKET_PROPERTY };
++    // security.print.tofile AÑADIDO al parche: sin él, QZ regenera qz-tray.properties
++    // en cada arranque (saveProperties tras crear los keystores SSL) y DESCARTA la
++    // property → el USB directo por device path ({file:/dev/usb/lpN}) siempre daba
++    // "Printing to file is not permitted". Al persistirla, el provisioning la escribe
++    // una vez y sobrevive a los reinicios.
++    public static final String[] PERSIST_PROPS = {"file.whitelist", "file.allow", "networking.hostname", "networking.port", "security.print.tofile", STEAL_WEBSOCKET_PROPERTY };
+     public static final String AUTOSTART_FILE = ".autostart";
+     public static final String DATA_DIR = "qz";
+ 
+diff --git a/src/qz/utils/LinuxUsbInfo.java b/src/qz/utils/LinuxUsbInfo.java
+new file mode 100644
+index 0000000..b5be7c1
+--- /dev/null
++++ b/src/qz/utils/LinuxUsbInfo.java
+@@ -0,0 +1,148 @@
++package qz.utils;
++
++import java.util.*;
++import java.nio.file.*;
++import org.codehaus.jettison.json.JSONObject;
++import org.codehaus.jettison.json.JSONException;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++/**
++ * Enriquecimiento de dispositivos USB en Linux a partir de sysfs
++ * (/sys/class/usbmisc/lpN → device/{idVendor,idProduct,serial,ieee1284_id}).
++ * Produce, por dispositivo, el device path REAL (/dev/usb/lpN, resuelto por el
++ * kernel; NO se adivina el orden), el serial (desempate de impresoras iguales),
++ * el IEEE-1284 y un friendlyName. Todo campo es ADITIVO: QZ viejo no lo emite y
++ * el TPV degrada a cola.
++ *
++ * La lógica de parseo (sysfs→DeviceInfo) es pura y testeable sin Linux; la
++ * lectura real (readSysfs) va tras isLinux().
++ */
++public class LinuxUsbInfo {
++    private static final Logger log = LogManager.getLogger(LinuxUsbInfo.class);
++    private static final String USBMISC = "/sys/class/usbmisc";
++
++    public static class DeviceInfo {
++        public String vendorId, productId, serial, ieee1284, friendlyName, devicePath;
++    }
++
++    private static String norm4(String s){
++        if(s==null) return null;
++        s=s.trim().toLowerCase().replaceFirst("^0x","");
++        return s.isEmpty()?null:s;
++    }
++
++    /** sysfs: nodo("lp0") -> { idVendor, idProduct, serial, ieee1284_id, product, manufacturer }. */
++    public static Map<String,DeviceInfo> parse(Map<String,Map<String,String>> sysfs){
++        Map<String,DeviceInfo> out=new HashMap<>();
++        if(sysfs==null) return out;
++        for(Map.Entry<String,Map<String,String>> e: sysfs.entrySet()){
++            String node=e.getKey();                 // "lp0"
++            Map<String,String> v=e.getValue();
++            String vid=norm4(v.get("idVendor"));
++            String pid=norm4(v.get("idProduct"));
++            if(vid==null||pid==null) continue;      // sin identidad → se omite
++            DeviceInfo d=new DeviceInfo();
++            d.vendorId=vid; d.productId=pid;
++            d.serial = v.get("serial")!=null ? v.get("serial").trim() : null;
++            d.ieee1284 = v.get("ieee1284_id")!=null ? v.get("ieee1284_id").trim() : null;
++            d.friendlyName = firstNonEmpty(v.get("manufacturer"), v.get("product"), mdlFrom1284(d.ieee1284));
++            d.devicePath = "/dev/usb/"+node;
++            out.put(vid+":"+pid, d);                // genérico (retrocompat sin serial)
++            if(d.serial!=null && !d.serial.isEmpty()){
++                out.put(vid+":"+pid+":"+d.serial, d); // específico (desempate)
++            }
++        }
++        return out;
++    }
++
++    private static String firstNonEmpty(String... xs){
++        for(String x: xs){ if(x!=null && !x.trim().isEmpty()) return x.trim(); }
++        return null;
++    }
++    /** Extrae MDL:… del Device ID IEEE-1284 (para el friendlyName si no hay product). */
++    private static String mdlFrom1284(String ieee){
++        if(ieee==null) return null;
++        for(String part: ieee.split(";")){
++            String p=part.trim();
++            if(p.startsWith("MDL:")) return p.substring(4).trim();
++        }
++        return null;
++    }
++
++    /** Vuelca los campos ADITIVOS de un DeviceInfo sobre un JSONObject de dispositivo. */
++    public static void applyTo(JSONObject o, DeviceInfo d) throws JSONException {
++        if(d==null) return;
++        if(d.devicePath!=null)   o.put("devicePath", d.devicePath);
++        if(d.serial!=null)       o.put("serial", d.serial);
++        if(d.ieee1284!=null)     o.put("ieee1284", d.ieee1284);
++        if(d.friendlyName!=null) o.put("friendlyName", d.friendlyName);
++    }
++
++    /** Lee sysfs de verdad. Defensivo: un nodo ilegible se omite (log.warn), nunca lanza. */
++    public static Map<String,DeviceInfo> readSysfs(){
++        if(!SystemUtilities.isLinux()) return Collections.emptyMap();
++        return readSysfsFrom(Paths.get(USBMISC));
++    }
++
++    // Campos que viven en el DISPOSITIVO USB (no en la interfaz): hay que subir
++    // desde `device` (que apunta a la interfaz, p.ej. 3-3:1.0) hacia el padre 3-3.
++    private static final String[] DEVICE_FIELDS = {"idVendor","idProduct","serial","product","manufacturer"};
++    // Cuántos niveles subir como máximo buscando el device con idVendor.
++    private static final int MAX_PARENTS = 6;
++
++    /** Como readSysfs pero con base parametrizable (testeable con un /sys de fixture).
++     *  GOTCHA sysfs real: `/sys/class/usbmisc/lpN/device` es un symlink a la INTERFAZ
++     *  (3-3:1.0), donde vive `ieee1284_id`; pero `idVendor/idProduct/serial/product`
++     *  viven en el DISPOSITIVO PADRE (3-3). Por eso se resuelve el symlink y se sube
++     *  hasta encontrar `idVendor`. (Bug 2026-07-20: sin subir, vid/pid salían vacíos
++     *  y el dispositivo se descartaba → TPV imprimía por cola pese al "directo".) */
++    public static Map<String,DeviceInfo> readSysfsFrom(Path base){
++        Map<String,Map<String,String>> raw=new HashMap<>();
++        try {
++            if(!Files.isDirectory(base)) return Collections.emptyMap();
++            try(DirectoryStream<Path> ds=Files.newDirectoryStream(base,"lp*")){
++                for(Path lp: ds){
++                    try {
++                        Path iface = lp.resolve("device").toRealPath();   // la interfaz USB
++                        Path usbDev = resolveUsbDevice(iface);            // sube al dispositivo con idVendor
++                        Map<String,String> m=new HashMap<>();
++                        // vid/pid/serial/product/manufacturer desde el DISPOSITIVO
++                        if(usbDev!=null){
++                            for(String f: DEVICE_FIELDS){ readField(usbDev, f, m); }
++                        }
++                        // ieee1284_id desde la INTERFAZ (ahí lo publica usblp)
++                        readField(iface, "ieee1284_id", m);
++                        raw.put(lp.getFileName().toString(), m);
++                    } catch(Exception ex){
++                        log.warn("LinuxUsbInfo: nodo {} ilegible: {}", lp, ex.toString());
++                    }
++                }
++            }
++        } catch(Exception e){
++            log.warn("LinuxUsbInfo: no puedo leer {}: {}", base, e.toString());
++            return Collections.emptyMap();
++        }
++        return parse(raw);
++    }
++
++    /** Sube desde la interfaz hacia los padres hasta encontrar el nodo con `idVendor`
++     *  (el dispositivo USB real). Devuelve null si no aparece en MAX_PARENTS niveles. */
++    private static Path resolveUsbDevice(Path iface){
++        Path p = iface;
++        for(int i=0; i<MAX_PARENTS && p!=null; i++){
++            if(Files.isReadable(p.resolve("idVendor"))) return p;
++            p = p.getParent();
++        }
++        return null;
++    }
++
++    private static void readField(Path dir, String f, Map<String,String> m){
++        try {
++            Path fp = dir.resolve(f);
++            if(Files.isReadable(fp)){
++                m.put(f, new String(Files.readAllBytes(fp)).trim());
++            }
++        } catch(Exception ignored){}
++    }
++}
+diff --git a/src/qz/utils/UsbUtilities.java b/src/qz/utils/UsbUtilities.java
+index c9b3669..4ae2a6e 100644
+--- a/src/qz/utils/UsbUtilities.java
++++ b/src/qz/utils/UsbUtilities.java
+@@ -80,6 +80,10 @@ public class UsbUtilities {
+         Map<String, WindowsUsbInfo.DeviceInfo> usbInfo =
+                 qz.utils.SystemUtilities.isWindows() ? WindowsUsbInfo.readRegistry() : java.util.Collections.emptyMap();
+ 
++        // Linux: leer sysfs UNA vez y cruzar por VID:PID (devicePath /dev/usb/lpN real + serial + ieee1284).
++        Map<String, LinuxUsbInfo.DeviceInfo> linuxInfo =
++                qz.utils.SystemUtilities.isLinux() ? LinuxUsbInfo.readSysfs() : java.util.Collections.emptyMap();
++
+         for(UsbDevice device : devices) {
+             UsbDeviceDescriptor desc = device.getUsbDeviceDescriptor();
+ 
+@@ -93,6 +97,11 @@ public class UsbUtilities {
+                 WindowsUsbInfo.applyTo(descJSON, usbInfo.get(key));
+             }
+ 
++            if(!linuxInfo.isEmpty()) {
++                String lkey = (UsbUtil.toHexString(desc.idVendor())+":"+UsbUtil.toHexString(desc.idProduct())).toLowerCase();
++                LinuxUsbInfo.applyTo(descJSON, linuxInfo.get(lkey));
++            }
++
+             deviceJSON.put(descJSON);
+         }
+ 
+diff --git a/src/qz/utils/WindowsUsbInfo.java b/src/qz/utils/WindowsUsbInfo.java
+index b767a2e..326cbcd 100644
+--- a/src/qz/utils/WindowsUsbInfo.java
++++ b/src/qz/utils/WindowsUsbInfo.java
+@@ -20,7 +20,7 @@ public class WindowsUsbInfo {
+     private static final String USBPRINT_GUID = "{28d78fad-5a12-11d1-ae5b-0000f803a8c2}";
+ 
+     public static class DeviceInfo {
+-        public String vendorId, productId, printerClass, ieee1284, friendlyName, devicePath, usbPort;
++        public String vendorId, productId, printerClass, ieee1284, friendlyName, devicePath, usbPort, serial;
+     }
+ 
+     /** Cruza el Port de spooler ("USB001") con el DeviceInfo cuyo usbPort coincida.
+@@ -62,6 +62,9 @@ public class WindowsUsbInfo {
+             if(!isPrinter(service,ieee)) continue;
+             DeviceInfo d=new DeviceInfo();
+             d.vendorId=vid.toLowerCase(); d.productId=pid.toLowerCase();
++            // El 3er tramo del device path (instanceId) ES el nº de serie/instance ID del
++            // dispositivo (validación empírica win 2026-07-19) → identidad {vid,pid,serial}.
++            d.serial=instanceId;
+             d.printerClass=service; d.ieee1284=ieee;
+             d.friendlyName=v.getOrDefault("FriendlyName", v.get("DeviceDesc"));
+             // usbPort ("USB001") = cruce cola↔dispositivo para printers.details.
+@@ -91,6 +94,7 @@ public class WindowsUsbInfo {
+         if(d.ieee1284!=null)     o.put("ieee1284", d.ieee1284);
+         if(d.friendlyName!=null) o.put("friendlyName", d.friendlyName);
+         if(d.devicePath!=null)   o.put("devicePath", d.devicePath);
++        if(d.serial!=null)       o.put("serial", d.serial);
+     }
+ 
+     private static final String ENUM_USB = "SYSTEM\\CurrentControlSet\\Enum\\USB";
+diff --git a/test/qz/utils/LinuxUsbInfoTest.java b/test/qz/utils/LinuxUsbInfoTest.java
+new file mode 100644
+index 0000000..2677447
+--- /dev/null
++++ b/test/qz/utils/LinuxUsbInfoTest.java
+@@ -0,0 +1,112 @@
++package qz.utils;
++import org.testng.annotations.Test;
++import java.util.*;
++import org.codehaus.jettison.json.JSONObject;
++import static org.testng.Assert.*;
++
++public class LinuxUsbInfoTest {
++    private Map<String,String> node(String vid,String pid,String serial,String ieee,String prod){
++        Map<String,String> m=new HashMap<>();
++        m.put("idVendor",vid); m.put("idProduct",pid);
++        if(serial!=null) m.put("serial",serial);
++        if(ieee!=null) m.put("ieee1284_id",ieee);
++        if(prod!=null) m.put("product",prod);
++        return m;
++    }
++    // Las 3 térmicas del informe 07-18, mapeadas a lp0/lp1/lp2.
++    private Map<String,Map<String,String>> tres(){
++        Map<String,Map<String,String>> s=new LinkedHashMap<>();
++        s.put("lp0",node("0416","5011","Printer","MFG:GD32;MDL:POS58;CMD:ESC/POS;","POS58"));
++        s.put("lp1",node("04b8","0202","J4FF025969","MFG:EPSON;MDL:TM-T88IV;CMD:ESC/POS;","TM-T88IV"));
++        s.put("lp2",node("1fc9","2016","702D07693632",null,"POS-80"));
++        return s;
++    }
++    @Test public void mapea_devicePath_por_nodo(){
++        Map<String,LinuxUsbInfo.DeviceInfo> out=LinuxUsbInfo.parse(tres());
++        assertEquals(out.get("1fc9:2016").devicePath,"/dev/usb/lp2");
++        assertEquals(out.get("04b8:0202").devicePath,"/dev/usb/lp1");
++        assertEquals(out.get("0416:5011").serial,"Printer");
++    }
++    @Test public void indexa_tambien_por_serial(){
++        Map<String,LinuxUsbInfo.DeviceInfo> out=LinuxUsbInfo.parse(tres());
++        assertEquals(out.get("1fc9:2016:702D07693632").devicePath,"/dev/usb/lp2");
++    }
++    @Test public void desempata_dos_iguales_por_serial(){
++        Map<String,Map<String,String>> s=new LinkedHashMap<>();
++        s.put("lp0",node("0416","5011","AAA",null,"POS58"));
++        s.put("lp1",node("0416","5011","BBB",null,"POS58"));
++        Map<String,LinuxUsbInfo.DeviceInfo> out=LinuxUsbInfo.parse(s);
++        assertEquals(out.get("0416:5011:AAA").devicePath,"/dev/usb/lp0");
++        assertEquals(out.get("0416:5011:BBB").devicePath,"/dev/usb/lp1");
++    }
++    @Test public void sin_ieee1284_resto_ok(){
++        Map<String,LinuxUsbInfo.DeviceInfo> out=LinuxUsbInfo.parse(tres());
++        assertNull(out.get("1fc9:2016").ieee1284);
++        assertEquals(out.get("1fc9:2016").devicePath,"/dev/usb/lp2");
++    }
++    @Test public void nodo_sin_vid_pid_se_omite(){
++        Map<String,Map<String,String>> s=new HashMap<>();
++        s.put("lp0",node(null,null,"X",null,null));
++        assertTrue(LinuxUsbInfo.parse(s).isEmpty());
++    }
++    @Test public void applyTo_vuelca_campos() throws Exception {
++        JSONObject o=new JSONObject();
++        LinuxUsbInfo.applyTo(o, LinuxUsbInfo.parse(tres()).get("04b8:0202"));
++        assertEquals(o.getString("devicePath"),"/dev/usb/lp1");
++        assertEquals(o.getString("serial"),"J4FF025969");
++        assertTrue(o.getString("ieee1284").contains("ESC/POS"));
++    }
++    @Test public void applyTo_cruza_por_vidpid_lower() throws Exception {
++        Map<String,LinuxUsbInfo.DeviceInfo> info=LinuxUsbInfo.parse(tres());
++        JSONObject dev=new JSONObject(); dev.put("vendorId","0x1FC9"); dev.put("productId","0x2016");
++        String key=(dev.getString("vendorId")+":"+dev.getString("productId")).toLowerCase().replace("0x","");
++        LinuxUsbInfo.applyTo(dev, info.get(key));
++        assertEquals(dev.getString("devicePath"),"/dev/usb/lp2");
++    }
++
++    // REPRODUCE bug real (POS80 en Linux 2026-07-20): el symlink `device` de
++    // /sys/class/usbmisc/lpN apunta a la INTERFAZ (3-3:1.0), no al dispositivo.
++    // idVendor/idProduct/serial/product viven en el DISPOSITIVO PADRE (3-3);
++    // solo ieee1284_id está en la interfaz. readSysfs debe subir al padre.
++    @Test public void readSysfs_sube_al_device_padre() throws Exception {
++        java.nio.file.Path tmp = java.nio.file.Files.createTempDirectory("usbmisc-test");
++        try {
++            // Estructura: <tmp>/class/usbmisc/lp0/device -> <tmp>/devices/usb3/3-3/3-3:1.0
++            java.nio.file.Path clazz = tmp.resolve("class/usbmisc/lp0");
++            java.nio.file.Path device = tmp.resolve("devices/usb3/3-3");          // dispositivo (padre)
++            java.nio.file.Path iface  = device.resolve("3-3:1.0");                // interfaz (destino del symlink)
++            java.nio.file.Files.createDirectories(clazz);
++            java.nio.file.Files.createDirectories(iface);
++            // vid/pid/serial/product en el DISPOSITIVO PADRE
++            write(device.resolve("idVendor"),  "1fc9");
++            write(device.resolve("idProduct"), "2016");
++            write(device.resolve("serial"),    "702D07693632");
++            write(device.resolve("product"),   "USB Printer P");
++            // ieee1284_id SOLO en la interfaz
++            write(iface.resolve("ieee1284_id"), "MFG:Printer;MDL:POS-80;CMD:ESC/POS;CLS:PRINTER;");
++            // symlink device -> interfaz (como en sysfs real)
++            java.nio.file.Files.createSymbolicLink(clazz.resolve("device"), iface);
++
++            Map<String,LinuxUsbInfo.DeviceInfo> out =
++                LinuxUsbInfo.readSysfsFrom(tmp.resolve("class/usbmisc"));
++            LinuxUsbInfo.DeviceInfo d = out.get("1fc9:2016");
++            assertNotNull(d, "debe detectar el POS80 subiendo al device padre");
++            assertEquals(d.vendorId, "1fc9");
++            assertEquals(d.productId, "2016");
++            assertEquals(d.serial, "702D07693632");
++            assertEquals(d.devicePath, "/dev/usb/lp0");
++            assertTrue(d.ieee1284.contains("ESC/POS"), "ieee1284 se lee de la interfaz");
++            assertEquals(out.get("1fc9:2016:702D07693632").devicePath, "/dev/usb/lp0");
++        } finally {
++            deleteRec(tmp.toFile());
++        }
++    }
++    private static void write(java.nio.file.Path p, String s) throws Exception {
++        java.nio.file.Files.write(p, (s+"\n").getBytes());
++    }
++    private static void deleteRec(java.io.File f){
++        java.io.File[] kids = f.listFiles();
++        if(kids!=null) for(java.io.File k: kids){ if(!java.nio.file.Files.isSymbolicLink(k.toPath())) deleteRec(k); else k.delete(); }
++        f.delete();
++    }
++}
+diff --git a/test/qz/utils/WindowsUsbInfoTest.java b/test/qz/utils/WindowsUsbInfoTest.java
+index fb6b15c..6714d4c 100644
+--- a/test/qz/utils/WindowsUsbInfoTest.java
++++ b/test/qz/utils/WindowsUsbInfoTest.java
+@@ -81,4 +81,12 @@ public class WindowsUsbInfoTest {
+         WindowsUsbInfo.DeviceInfo d=WindowsUsbInfo.parse(reg).get("1fc9:2016");
+         assertEquals(d.usbPort,"USB003");
+     }
++
++    @Test public void pos80_expone_serial(){
++        Map<String,Map<String,String>> reg=new HashMap<>();
++        reg.put("VID_1FC9&PID_2016\\702D07693632",
++            vals("Service","usbprint"));
++        WindowsUsbInfo.DeviceInfo d=WindowsUsbInfo.parse(reg).get("1fc9:2016");
++        assertEquals(d.serial,"702D07693632");
++    }
+ }

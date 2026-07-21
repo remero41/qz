@@ -1,5 +1,12 @@
 [
   {
+    "description": "Permitir impresion directa a device path (USB directo por {file}) — sin esto QZ lanza 'not permitted'. Fase INSTALL: corre SIEMPRE en la instalacion del .run/.exe/.pkg (certgen solo corria condicional a isAdmin tras generar cert y NO se aplicaba).",
+    "type": "property",
+    "phase": "install",
+    "os": "*",
+    "data": "security.print.tofile=true"
+  },
+  {
     "description": "Arranque blindado QZ (tarea + watchdog)",
     "type": "Script",
     "phase": "install",
