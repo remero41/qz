@@ -138,6 +138,19 @@ jobs:
           ant makeself "${ARGS[@]}"
           ls -la out/*.run
 
+      # Nombre FIJO qz.run: makeself genera el .run con la version dentro del
+      # nombre (qz-tray-X.Y.Z.run), asi que la URL de descarga cambiaria en cada
+      # release. Renombrando a qz.run, el enlace
+      # .../releases/latest/download/qz.run es estable y no hay que tocar el TPV
+      # al publicar una version nueva.
+      - name: Renombrar instalador a qz.run
+        working-directory: tray
+        run: |
+          SRC=$(ls out/*.run | head -1)
+          [ -n "$SRC" ] || { echo "::error::no se genero ningun .run"; exit 1; }
+          [ "$SRC" = "out/qz.run" ] || mv "$SRC" out/qz.run
+          ls -la out/qz.run
+
       - name: Limpiar secretos del workspace
         if: always()
         run: rm -f tray/cert.pem tray/key.pem tray/override.crt
@@ -146,7 +159,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: qz-tray-linux
-          path: tray/out/*.run
+          path: tray/out/qz.run
           if-no-files-found: error
 
       - name: Adjuntar a Release
@@ -154,4 +167,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release }}
-          files: tray/out/*.run
+          files: tray/out/qz.run

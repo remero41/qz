@@ -161,6 +161,20 @@ jobs:
           ant nsis "${ARGS[@]}"
           ls -la out/*.exe
 
+      # Nombre FIJO qz.exe: NSIS genera el .exe con la version dentro del nombre
+      # (qz-tray-X.Y.Z.exe), asi que la URL de descarga cambiaria en cada
+      # release. Renombrando a qz.exe, el enlace
+      # .../releases/latest/download/qz.exe es estable y no hay que tocar el TPV
+      # al publicar una version nueva.
+      - name: Renombrar instalador a qz.exe
+        working-directory: tray
+        shell: bash
+        run: |
+          SRC=$(ls out/*.exe | head -1)
+          [ -n "$SRC" ] || { echo "::error::no se genero ningun .exe"; exit 1; }
+          [ "$SRC" = "out/qz.exe" ] || mv "$SRC" out/qz.exe
+          ls -la out/qz.exe
+
       # No dejar secretos en el workspace.
       - name: Limpiar secretos del workspace
         if: always()
@@ -171,7 +185,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: qz-tray-windows
-          path: tray/out/*.exe
+          path: tray/out/qz.exe
           if-no-files-found: error
 
       - name: Adjuntar a Release
@@ -179,4 +193,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release }}
-          files: tray/out/*.exe
+          files: tray/out/qz.exe
