@@ -80,14 +80,28 @@ jobs:
           git checkout "$QZ_SOURCE_REF"
           echo "Fuente en $(git rev-parse --short HEAD)"
 
-      # 2b) Aplicar el parche de device path USB Windows (aditivo; el código nuevo
-      #     es Windows-only en runtime, así que compila igual en el build de Mac).
-      - name: Aplicar parche device path Windows
+      # 2b) Aplicar los CUATRO parches EN ORDEN (cada uno se generó sobre el anterior).
+      #     Todos son aditivos y su código solo se ACTIVA en runtime bajo su SO
+      #     (isWindows()/isLinux()), así que compilan igual en el build de Mac.
+      #       0001 win  devicePath/vid/pid · 0002 linux /dev/usb/lpN + serial
+      #       0003 win  workOffline        · 0004 linux printerState + stateReasons
+      - name: Aplicar parches (devicePath 0001/0002 + estado de cola 0003/0004)
         working-directory: tray
         run: |
-          git apply --check ../this-repo/patches/0001-usb-details-windows-devicepath.patch
-          git apply        ../this-repo/patches/0001-usb-details-windows-devicepath.patch
-          echo "Parche device path aplicado."
+          for p in 0001-usb-details-windows-devicepath \
+                   0002-usb-details-linux-devicepath \
+                   0003-printer-status-workoffline-windows \
+                   0004-printer-status-cups-linux; do
+            git apply --check "../this-repo/patches/$p.patch"
+            git apply        "../this-repo/patches/$p.patch"
+            echo "  aplicado: $p"
+          done
+          echo "Parches 0001+0002+0003+0004 aplicados."
+
+      # 2c) Tests TestNG. El build FALLA si un test cae: no se publica a medias.
+      - name: Tests TestNG
+        working-directory: tray
+        run: ant unit-tests
 
       # 3) Copiar el provisioning versionado en nuestro repo dentro del arbol tray.
       - name: Colocar provisioning

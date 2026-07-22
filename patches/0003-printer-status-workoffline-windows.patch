@@ -1,0 +1,217 @@
+diff --git a/src/qz/printer/PrintServiceMatcher.java b/src/qz/printer/PrintServiceMatcher.java
+index 84abc64..d671269 100644
+--- a/src/qz/printer/PrintServiceMatcher.java
++++ b/src/qz/printer/PrintServiceMatcher.java
+@@ -190,6 +190,13 @@ public class PrintServiceMatcher {
+ 
+         boolean mediaTrayCrawled = false;
+ 
++        // Estado VIVO de las colas de Windows, leido UNA sola vez para todo el listado
++        // (no por impresora). MEDIDO 2026-07-22 en hardware real: PRINTER_ATTRIBUTE_WORK_OFFLINE
++        // es lo unico que reacciona al apagado fisico; PrinterState/PrinterStatus NO se mueven.
++        // ADITIVO: mapa vacio -> no se emite campo -> el TPV lo trata como indeterminado.
++        java.util.Map<String,Boolean> workOffline = includeDetails && qz.utils.SystemUtilities.isWindows()
++                ? qz.utils.WindowsPrinterStatus.readSpooler() : java.util.Collections.emptyMap();
++
+         Collection<NativePrinter> nativePrinters = getNativePrinterList().values();
+         if(debug) log.debug("Iterating over all {} discovered printer(s)", nativePrinters.size());
+ 
+@@ -216,6 +223,12 @@ public class PrintServiceMatcher {
+                         if(dev.productId != null)  jsonService.put("productId", dev.productId);
+                     }
+                 }
++
++                // Windows (parche 0003): workOffline = el spooler dice que la impresora no
++                // responde AHORA. Funciona tambien en ESDPRT001, donde no hay serial con que
++                // cruzar el bus: el estado es POR COLA, no por puerto (cierra la limitacion #26).
++                Boolean off = workOffline.get(ps.getName());
++                if(off != null) jsonService.put("workOffline", off.booleanValue());
+                 if(debug) log.debug("'{}': '{}' (Driver)", printer.getPrinterId(), printer.getDriver().value());
+                 if(debug) log.debug("'{}': '{}' (Connection)", printer.getPrinterId(), printer.getConnection());
+ 
+diff --git a/src/qz/utils/WindowsPrinterStatus.java b/src/qz/utils/WindowsPrinterStatus.java
+new file mode 100644
+index 0000000..d156918
+--- /dev/null
++++ b/src/qz/utils/WindowsPrinterStatus.java
+@@ -0,0 +1,81 @@
++package qz.utils;
++
++import java.util.*;
++import com.sun.jna.platform.win32.Winspool;
++import com.sun.jna.platform.win32.WinspoolUtil;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++/**
++ * Estado VIVO de las colas de impresión de Windows, por nombre de cola.
++ *
++ * MEDIDO en hardware real el 2026-07-22 (POS-80 apagada/encendida con el
++ * interruptor, sin tocar el cable USB):
++ *
++ *   - PRINTER_INFO_2.Attributes & PRINTER_ATTRIBUTE_WORK_OFFLINE (0x400)
++ *     cambia False -> True al apagar y vuelve a False en menos de 6 s al
++ *     encender. Es el UNICO campo que se movio en toda la tabla.
++ *   - PRINTER_INFO_2.Status (PrinterState/PrinterStatus de PowerShell) NO se
++ *     mueve al apagar: valia lo mismo encendida y apagada. NO USARLO.
++ *   - JobCount tampoco sirve: arrastra trabajos "Complete" de hace un año.
++ *
++ * Funciona incluso en colas sobre ESDPRT001 (Epson TMUSB), donde no hay serial
++ * ni vid/pid con que cruzar el bus: el estado es POR COLA, no por puerto.
++ *
++ * Todo campo es ADITIVO: si el estado no se puede leer, el mapa no contiene la
++ * cola y PrintServiceMatcher no emite el campo -> el TPV lo trata como
++ * "indeterminado" (nunca como "presente"), que es el comportamiento de la flota
++ * con QZ sin parchear.
++ *
++ * La logica de decision (Attributes -> workOffline) es pura y testeable sin
++ * Windows (isWorkOffline); la lectura real del spooler va tras isWindows().
++ */
++public class WindowsPrinterStatus {
++    private static final Logger log = LogManager.getLogger(WindowsPrinterStatus.class);
++
++    /** PRINTER_ATTRIBUTE_WORK_OFFLINE. Definido aqui por claridad; coincide con Winspool. */
++    public static final int PRINTER_ATTRIBUTE_WORK_OFFLINE = 0x00000400;
++
++    /** Decision pura: ¿el spooler marca esta cola como "trabajar sin conexion"?
++     *  Es el bit medido que reacciona al interruptor. */
++    public static boolean isWorkOffline(int attributes) {
++        return (attributes & PRINTER_ATTRIBUTE_WORK_OFFLINE) != 0;
++    }
++
++    /** Parseo puro: nombre de cola -> workOffline. Testeable sin Windows.
++     *  Colas con nombre nulo o vacio se omiten (no hay con que indexarlas). */
++    public static Map<String,Boolean> parse(Map<String,Integer> nameToAttributes) {
++        Map<String,Boolean> out = new HashMap<>();
++        if(nameToAttributes == null) return out;
++        for(Map.Entry<String,Integer> e : nameToAttributes.entrySet()) {
++            String name = e.getKey();
++            Integer attrs = e.getValue();
++            if(name == null || name.trim().isEmpty() || attrs == null) continue;
++            out.put(name, isWorkOffline(attrs));
++        }
++        return out;
++    }
++
++    /** Lee el spooler de verdad. Fail-safe: ante cualquier error devuelve {} y
++     *  el campo no se emite (el TPV degrada a "indeterminado", nunca a "presente"). */
++    public static Map<String,Boolean> readSpooler() {
++        if(!SystemUtilities.isWindows()) return Collections.emptyMap();
++        Map<String,Integer> raw = new HashMap<>();
++        try {
++            Winspool.PRINTER_INFO_2[] printers = WinspoolUtil.getAllPrinterInfo2();
++            for(Winspool.PRINTER_INFO_2 p : printers) {
++                if(p == null || p.pPrinterName == null) continue;
++                raw.put(p.pPrinterName, p.Attributes);
++            }
++        } catch(Throwable t) {
++            log.warn("WindowsPrinterStatus: no puedo leer el spooler (workOffline no se emitira): {}", t.toString());
++            return Collections.emptyMap();
++        }
++        Map<String,Boolean> out = parse(raw);
++        log.info("WindowsPrinterStatus: {} colas leidas del spooler", out.size());
++        for(Map.Entry<String,Boolean> e : out.entrySet()) {
++            log.info("  -> '{}' workOffline={}", e.getKey(), e.getValue());
++        }
++        return out;
++    }
++}
+diff --git a/test/qz/utils/WindowsPrinterStatusTest.java b/test/qz/utils/WindowsPrinterStatusTest.java
+new file mode 100644
+index 0000000..4496337
+--- /dev/null
++++ b/test/qz/utils/WindowsPrinterStatusTest.java
+@@ -0,0 +1,93 @@
++package qz.utils;
++
++import org.testng.annotations.Test;
++import java.util.*;
++
++import static org.testng.Assert.*;
++
++/**
++ * TDD de la parte PURA del parche 0003 (workOffline en Windows).
++ *
++ * Los valores de Attributes salen de la medición en hardware real del
++ * 2026-07-22 (informe INFORME-workoffline-cierra-limitacion-26-2026-07-22.md):
++ * la cola "tickets" (POS-80) pasó de workOffline=False a True al apagar con el
++ * interruptor, y ninguna otra cola se movió.
++ */
++public class WindowsPrinterStatusTest {
++
++    // PRINTER_ATTRIBUTE_LOCAL | PRINTER_ATTRIBUTE_QUEUED  (ruido tipico, sin offline)
++    private static final int ATTRS_NORMALES = 0x00000040 | 0x00000001;
++    private static final int WORK_OFFLINE   = 0x00000400;
++
++    @Test public void bit_offline_apagada() {
++        assertTrue(WindowsPrinterStatus.isWorkOffline(ATTRS_NORMALES | WORK_OFFLINE));
++    }
++
++    @Test public void bit_offline_encendida() {
++        assertFalse(WindowsPrinterStatus.isWorkOffline(ATTRS_NORMALES));
++    }
++
++    /** El bit se lee AISLADO: otros atributos encendidos no deben falsear el veredicto. */
++    @Test public void otros_atributos_no_contaminan() {
++        int ruido = 0x00000008 | 0x00000010 | 0x00000080 | 0x00004000; // DIRECT, DEFAULT, SHARED, KEEPPRINTEDJOBS
++        assertFalse(WindowsPrinterStatus.isWorkOffline(ruido));
++        assertTrue(WindowsPrinterStatus.isWorkOffline(ruido | WORK_OFFLINE));
++    }
++
++    /** Foto B del informe: solo "tickets" se movió; las otras 5 colas quietas. */
++    @Test public void foto_pos80_apagada_solo_se_mueve_su_cola() {
++        Map<String,Integer> raw = new LinkedHashMap<>();
++        raw.put("ticketepson",              ATTRS_NORMALES);
++        raw.put("ticketsraw",               ATTRS_NORMALES);
++        raw.put("tickets",                  ATTRS_NORMALES | WORK_OFFLINE); // POS-80 apagada
++        raw.put("Microsoft Print to PDF",   ATTRS_NORMALES);
++        raw.put("EPSON TM-T88IV ReceiptE4", ATTRS_NORMALES);
++        raw.put("Brother QL-700",           ATTRS_NORMALES);
++
++        Map<String,Boolean> out = WindowsPrinterStatus.parse(raw);
++        assertEquals(out.size(), 6);
++        assertTrue(out.get("tickets"));
++        assertFalse(out.get("ticketepson"));
++        assertFalse(out.get("ticketsraw"));
++        assertFalse(out.get("Microsoft Print to PDF"));
++        assertFalse(out.get("EPSON TM-T88IV ReceiptE4"));
++        assertFalse(out.get("Brother QL-700"));
++    }
++
++    /** ESDPRT001: dos colas sobre el MISMO puerto con veredictos distintos.
++     *  Es lo que desmonta la limitación #26: el estado es por COLA, no por puerto. */
++    @Test public void esdprt_dos_colas_mismo_puerto_estados_distintos() {
++        Map<String,Integer> raw = new HashMap<>();
++        raw.put("ticketepson",              ATTRS_NORMALES | WORK_OFFLINE);
++        raw.put("EPSON TM-T88IV ReceiptE4", ATTRS_NORMALES);
++        Map<String,Boolean> out = WindowsPrinterStatus.parse(raw);
++        assertTrue(out.get("ticketepson"));
++        assertFalse(out.get("EPSON TM-T88IV ReceiptE4"));
++    }
++
++    /** Fail-safe: sin datos, mapa vacio -> el campo no se emite -> "indeterminado".
++     *  NUNCA debe inventarse un false (seria "presente" por omision: el antipatron). */
++    @Test public void sin_datos_mapa_vacio_no_false_por_defecto() {
++        assertTrue(WindowsPrinterStatus.parse(null).isEmpty());
++        assertTrue(WindowsPrinterStatus.parse(new HashMap<>()).isEmpty());
++    }
++
++    /** Filas basura del spooler se omiten en vez de envenenar el mapa. */
++    @Test public void nombres_invalidos_se_omiten() {
++        Map<String,Integer> raw = new HashMap<>();
++        raw.put(null, ATTRS_NORMALES);
++        raw.put("",   ATTRS_NORMALES);
++        raw.put("  ", ATTRS_NORMALES);
++        raw.put("buena", ATTRS_NORMALES | WORK_OFFLINE);
++        Map<String,Boolean> out = WindowsPrinterStatus.parse(raw);
++        assertEquals(out.size(), 1);
++        assertTrue(out.get("buena"));
++    }
++
++    /** Attributes nulo (fila incompleta) no se convierte en false silencioso. */
++    @Test public void attributes_nulo_se_omite() {
++        Map<String,Integer> raw = new HashMap<>();
++        raw.put("sin-attrs", null);
++        assertTrue(WindowsPrinterStatus.parse(raw).isEmpty());
++    }
++}

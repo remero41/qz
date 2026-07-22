@@ -1,0 +1,359 @@
+diff --git a/src/qz/printer/PrintServiceMatcher.java b/src/qz/printer/PrintServiceMatcher.java
+index d671269..662b581 100644
+--- a/src/qz/printer/PrintServiceMatcher.java
++++ b/src/qz/printer/PrintServiceMatcher.java
+@@ -197,6 +197,13 @@ public class PrintServiceMatcher {
+         java.util.Map<String,Boolean> workOffline = includeDetails && qz.utils.SystemUtilities.isWindows()
+                 ? qz.utils.WindowsPrinterStatus.readSpooler() : java.util.Collections.emptyMap();
+ 
++        // Estado VIVO de las colas de CUPS, tambien UNA sola vez. MECANISMO DISTINTO al de
++        // Windows y el contrato lo respeta: alli se marca un atributo y la cola sigue activa;
++        // aqui CUPS PARA la cola entera (printer-state=5) y al reconectar la rehabilita e
++        // imprime lo pendiente. Por eso van DOS campos, no un booleano.
++        java.util.Map<String,qz.utils.LinuxPrinterStatus.QueueState> cupsState = includeDetails && qz.utils.SystemUtilities.isLinux()
++                ? qz.utils.LinuxPrinterStatus.readCups() : java.util.Collections.emptyMap();
++
+         Collection<NativePrinter> nativePrinters = getNativePrinterList().values();
+         if(debug) log.debug("Iterating over all {} discovered printer(s)", nativePrinters.size());
+ 
+@@ -229,6 +236,17 @@ public class PrintServiceMatcher {
+                 // cruzar el bus: el estado es POR COLA, no por puerto (cierra la limitacion #26).
+                 Boolean off = workOffline.get(ps.getName());
+                 if(off != null) jsonService.put("workOffline", off.booleanValue());
++
++                // Linux (parche 0004): printerState (3 idle / 4 processing / 5 stopped) +
++                // stateReasons. El "5" solo dice que la cola esta parada; la razon dice POR QUE
++                // (offline-report = apagada, media-empty = sin papel, cover-open = tapa abierta).
++                qz.utils.LinuxPrinterStatus.QueueState qs = cupsState.get(ps.getName());
++                if(qs != null) {
++                    jsonService.put("printerState", qs.state);
++                    if(!qs.reasons.isEmpty()) {
++                        jsonService.put("stateReasons", new JSONArray(qs.reasons));
++                    }
++                }
+                 if(debug) log.debug("'{}': '{}' (Driver)", printer.getPrinterId(), printer.getDriver().value());
+                 if(debug) log.debug("'{}': '{}' (Connection)", printer.getPrinterId(), printer.getConnection());
+ 
+diff --git a/src/qz/utils/LinuxPrinterStatus.java b/src/qz/utils/LinuxPrinterStatus.java
+new file mode 100644
+index 0000000..59a22da
+--- /dev/null
++++ b/src/qz/utils/LinuxPrinterStatus.java
+@@ -0,0 +1,168 @@
++package qz.utils;
++
++import java.util.*;
++import com.sun.jna.Pointer;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import qz.printer.status.Cups;
++import qz.printer.status.Cups.IPP;
++
++/**
++ * Estado VIVO de las colas de CUPS, por nombre de cola.
++ *
++ * MEDIDO en hardware real el 2026-07-22 (POS-80 apagada/encendida con el
++ * interruptor; informe INFORME-workoffline-cierra-limitacion-26-2026-07-22.md):
++ *
++ *   21:02:12  apagada  -> "la impresora ticket80 esta deshabilitada ...
++ *                          Unplugged or turned off / Alertas: paused"
++ *   21:04:12  encolado -> CUPS ACEPTA el trabajo aunque sabe que esta apagada
++ *   21:05:40  encendida-> rehabilita SOLA e IMPRIME lo pendiente (papel verificado)
++ *
++ * MECANISMO DISTINTO AL DE WINDOWS, y el contrato lo respeta:
++ *   - Windows marca un ATRIBUTO (workOffline) y la cola sigue activa.
++ *   - Linux PARA la cola entera (printer-state = 5 STOPPED + reasons).
++ * El estado "cola parada" existe en Linux y NO en Windows: por eso aqui se
++ * emiten dos campos (printerState + stateReasons) y no un booleano.
++ *
++ * REGALO: printer-state-reasons trae ademas "media-empty" (SIN PAPEL) y
++ * "cover-open" (TAPA ABIERTA) -> el escenario de consumibles sale gratis.
++ *
++ * Todo campo es ADITIVO: si el estado no se puede leer, la cola no aparece en el
++ * mapa y PrintServiceMatcher no emite nada -> el TPV lo trata como
++ * "indeterminado" (nunca "presente"), igual que la flota con QZ sin parchear.
++ *
++ * El parseo (reasons -> veredicto) es puro y testeable sin CUPS; la consulta IPP
++ * real va tras isLinux().
++ */
++public class LinuxPrinterStatus {
++    private static final Logger log = LogManager.getLogger(LinuxPrinterStatus.class);
++
++    /** printer-state de IPP (RFC 8011): 3=idle, 4=processing, 5=stopped. */
++    public static final int STATE_IDLE = 3;
++    public static final int STATE_PROCESSING = 4;
++    public static final int STATE_STOPPED = 5;
++
++    /** Razones que significan "la impresora no responde / no esta". */
++    private static final Set<String> RAZONES_AUSENTE = new HashSet<>(Arrays.asList(
++            "offline-report", "connecting-to-device", "timed-out", "shutdown"));
++
++    /** Razones de consumible: la impresora ESTA, pero no puede imprimir ahora. */
++    private static final Set<String> RAZONES_CONSUMIBLE = new HashSet<>(Arrays.asList(
++            "media-empty", "media-needed", "media-jam", "cover-open", "door-open",
++            "toner-empty", "marker-supply-empty"));
++
++    public static class QueueState {
++        public int state;                       // 3 | 4 | 5
++        public List<String> reasons = new ArrayList<>();
++
++        /** ¿La cola esta parada? Solo existe en Linux; Windows no tiene este estado. */
++        public boolean isStopped() { return state == STATE_STOPPED; }
++
++        /** ¿Alguna razon indica que la impresora no responde? */
++        public boolean sinRespuesta() {
++            for(String r : reasons) if(RAZONES_AUSENTE.contains(base(r))) return true;
++            return false;
++        }
++
++        /** ¿Alguna razon es de consumible (papel/tapa/toner)? */
++        public boolean problemaDeConsumible() {
++            for(String r : reasons) if(RAZONES_CONSUMIBLE.contains(base(r))) return true;
++            return false;
++        }
++    }
++
++    /** CUPS sufija las reasons con severidad: "media-empty-error", "cover-open-warning".
++     *  El nombre base es lo que identifica la condicion. */
++    static String base(String reason) {
++        if(reason == null) return "";
++        String r = reason.trim().toLowerCase();
++        for(String suf : new String[]{"-error", "-warning", "-report"}) {
++            // "offline-report" es un nombre COMPLETO, no un sufijo de severidad:
++            // solo se recorta si lo que queda sigue siendo un nombre conocido.
++            if(r.endsWith(suf)) {
++                String corto = r.substring(0, r.length() - suf.length());
++                if(RAZONES_AUSENTE.contains(corto) || RAZONES_CONSUMIBLE.contains(corto)) return corto;
++            }
++        }
++        return r;
++    }
++
++    /** Parseo puro: cola -> (state, reasons). Testeable sin CUPS.
++     *  "none" es la reason que CUPS usa para "nada que reportar": se descarta. */
++    public static Map<String,QueueState> parse(Map<String,Integer> states,
++                                               Map<String,List<String>> reasons) {
++        Map<String,QueueState> out = new HashMap<>();
++        if(states == null) return out;
++        for(Map.Entry<String,Integer> e : states.entrySet()) {
++            String name = e.getKey();
++            Integer st = e.getValue();
++            if(name == null || name.trim().isEmpty() || st == null) continue;
++            QueueState q = new QueueState();
++            q.state = st;
++            List<String> rs = reasons == null ? null : reasons.get(name);
++            if(rs != null) {
++                for(String r : rs) {
++                    if(r == null) continue;
++                    String t = r.trim();
++                    if(t.isEmpty() || t.equalsIgnoreCase("none")) continue;
++                    q.reasons.add(t);
++                }
++            }
++            out.put(name, q);
++        }
++        return out;
++    }
++
++    /** Consulta CUPS de verdad (CUPS-Get-Printers, mismo patron que
++     *  CupsUtils.getAllStatuses). Fail-safe: ante error devuelve {}. */
++    public static Map<String,QueueState> readCups() {
++        if(!SystemUtilities.isLinux()) return Collections.emptyMap();
++        Map<String,Integer> states = new HashMap<>();
++        Map<String,List<String>> reasons = new HashMap<>();
++        Pointer response = null;
++        try {
++            Cups cups = Cups.INSTANCE;
++            Pointer request = cups.ippNewRequest(IPP.GET_PRINTERS);
++            cups.ippAddString(request, IPP.TAG_OPERATION, IPP.TAG_NAME, "requesting-user-name",
++                              "", System.getProperty("user.name"));
++            response = cups.cupsDoRequest(
++                    cups.httpConnectEncrypt(cups.cupsServer(), IPP.PORT, cups.cupsEncryption()),
++                    request, "/");
++            if(response == null || response == Pointer.NULL) return Collections.emptyMap();
++
++            // Los tres atributos van EN ORDEN por impresora; se recorren en paralelo,
++            // igual que hace CupsUtils.getAllStatuses.
++            Pointer stateAttr  = cups.ippFindAttribute(response, "printer-state", IPP.TAG_ENUM);
++            Pointer reasonAttr = cups.ippFindAttribute(response, "printer-state-reasons", IPP.TAG_KEYWORD);
++            Pointer nameAttr   = cups.ippFindAttribute(response, "printer-name", IPP.TAG_NAME);
++
++            while(stateAttr != Pointer.NULL && nameAttr != Pointer.NULL) {
++                String name = cups.ippGetString(nameAttr, 0, "");
++                if(name != null && !name.trim().isEmpty()) {
++                    states.put(name, cups.ippGetInteger(stateAttr, 0));
++                    List<String> rs = new ArrayList<>();
++                    if(reasonAttr != Pointer.NULL) {
++                        int n = cups.ippGetCount(reasonAttr);
++                        for(int i = 0; i < n; i++) rs.add(cups.ippGetString(reasonAttr, i, ""));
++                    }
++                    reasons.put(name, rs);
++                }
++                stateAttr  = cups.ippFindNextAttribute(response, "printer-state", IPP.TAG_ENUM);
++                reasonAttr = cups.ippFindNextAttribute(response, "printer-state-reasons", IPP.TAG_KEYWORD);
++                nameAttr   = cups.ippFindNextAttribute(response, "printer-name", IPP.TAG_NAME);
++            }
++        } catch(Throwable t) {
++            log.warn("LinuxPrinterStatus: no puedo consultar CUPS (printerState no se emitira): {}", t.toString());
++            return Collections.emptyMap();
++        } finally {
++            try { if(response != null && response != Pointer.NULL) Cups.INSTANCE.ippDelete(response); }
++            catch(Throwable ignored) {}
++        }
++        Map<String,QueueState> out = parse(states, reasons);
++        log.info("LinuxPrinterStatus: {} colas leidas de CUPS", out.size());
++        for(Map.Entry<String,QueueState> e : out.entrySet()) {
++            log.info("  -> '{}' state={} reasons={}", e.getKey(), e.getValue().state, e.getValue().reasons);
++        }
++        return out;
++    }
++}
+diff --git a/test/qz/utils/LinuxPrinterStatusTest.java b/test/qz/utils/LinuxPrinterStatusTest.java
+new file mode 100644
+index 0000000..134e049
+--- /dev/null
++++ b/test/qz/utils/LinuxPrinterStatusTest.java
+@@ -0,0 +1,143 @@
++package qz.utils;
++
++import org.testng.annotations.Test;
++import java.util.*;
++
++import qz.utils.LinuxPrinterStatus.QueueState;
++
++import static org.testng.Assert.*;
++
++/**
++ * TDD de la parte PURA del parche 0004 (printerState + stateReasons en Linux).
++ *
++ * Anclado a la medicion en hardware real del 2026-07-22: la POS-80 ("ticket80")
++ * paso a "deshabilitada / Unplugged or turned off / Alertas: paused" al apagarla
++ * con el interruptor, y se rehabilito sola imprimiendo lo pendiente al encender.
++ */
++public class LinuxPrinterStatusTest {
++
++    private static Map<String,Integer> states(Object... kv) {
++        Map<String,Integer> m = new LinkedHashMap<>();
++        for(int i = 0; i < kv.length; i += 2) m.put((String)kv[i], (Integer)kv[i+1]);
++        return m;
++    }
++    private static Map<String,List<String>> reasons(String name, String... rs) {
++        Map<String,List<String>> m = new HashMap<>();
++        m.put(name, Arrays.asList(rs));
++        return m;
++    }
++
++    // ---- 21:02:12 — ticket80 apagada con el interruptor ----------------------
++
++    @Test public void ticket80_apagada_cola_parada_y_sin_respuesta() {
++        Map<String,QueueState> out = LinuxPrinterStatus.parse(
++                states("ticket80", LinuxPrinterStatus.STATE_STOPPED),
++                reasons("ticket80", "offline-report", "paused"));
++        QueueState q = out.get("ticket80");
++        assertNotNull(q);
++        assertTrue(q.isStopped(), "CUPS deshabilita la cola entera: state=5");
++        assertTrue(q.sinRespuesta(), "offline-report = la impresora no responde");
++        assertFalse(q.problemaDeConsumible());
++    }
++
++    // ---- 21:05:40 — reconexion: rehabilita sola -----------------------------
++
++    @Test public void ticket80_reconectada_cola_activa() {
++        Map<String,QueueState> out = LinuxPrinterStatus.parse(
++                states("ticket80", LinuxPrinterStatus.STATE_IDLE),
++                reasons("ticket80", "none"));
++        QueueState q = out.get("ticket80");
++        assertFalse(q.isStopped());
++        assertFalse(q.sinRespuesta());
++        assertTrue(q.reasons.isEmpty(), "'none' no es una razon: se descarta");
++    }
++
++    @Test public void imprimiendo_es_estado_sano() {
++        QueueState q = LinuxPrinterStatus.parse(
++                states("ticket80", LinuxPrinterStatus.STATE_PROCESSING), null).get("ticket80");
++        assertFalse(q.isStopped());
++        assertFalse(q.sinRespuesta());
++    }
++
++    // ---- Precision: solo se movio la cola tocada ----------------------------
++
++    @Test public void precision_otras_colas_no_se_mueven() {
++        Map<String,Integer> st = states(
++                "ticket80", LinuxPrinterStatus.STATE_STOPPED,
++                "ticket58", LinuxPrinterStatus.STATE_IDLE,
++                "tickets",  LinuxPrinterStatus.STATE_IDLE);
++        Map<String,List<String>> rs = new HashMap<>();
++        rs.put("ticket80", Arrays.asList("offline-report", "paused"));
++        rs.put("ticket58", Collections.singletonList("none"));
++        rs.put("tickets",  Collections.singletonList("none"));
++
++        Map<String,QueueState> out = LinuxPrinterStatus.parse(st, rs);
++        assertTrue(out.get("ticket80").sinRespuesta());
++        assertFalse(out.get("ticket58").sinRespuesta());
++        assertFalse(out.get("tickets").sinRespuesta());
++    }
++
++    // ---- REGALO: papel y tapa salen gratis ----------------------------------
++
++    @Test public void sin_papel_es_consumible_no_ausencia() {
++        QueueState q = LinuxPrinterStatus.parse(
++                states("ticket80", LinuxPrinterStatus.STATE_STOPPED),
++                reasons("ticket80", "media-empty-error")).get("ticket80");
++        assertTrue(q.problemaDeConsumible(), "media-empty = SIN PAPEL");
++        assertFalse(q.sinRespuesta(), "sin papel NO es que la impresora no este");
++    }
++
++    @Test public void tapa_abierta_es_consumible_no_ausencia() {
++        QueueState q = LinuxPrinterStatus.parse(
++                states("ticket80", LinuxPrinterStatus.STATE_STOPPED),
++                reasons("ticket80", "cover-open-warning")).get("ticket80");
++        assertTrue(q.problemaDeConsumible());
++        assertFalse(q.sinRespuesta());
++    }
++
++    /** El sufijo de severidad no puede cambiar el veredicto de la condicion. */
++    @Test public void severidad_no_altera_la_condicion() {
++        assertEquals(LinuxPrinterStatus.base("media-empty-error"), "media-empty");
++        assertEquals(LinuxPrinterStatus.base("media-empty-warning"), "media-empty");
++        assertEquals(LinuxPrinterStatus.base("cover-open-error"), "cover-open");
++        assertEquals(LinuxPrinterStatus.base("MEDIA-EMPTY-ERROR"), "media-empty");
++    }
++
++    /** "offline-report" es un nombre COMPLETO, no "offline" + severidad "-report".
++     *  Recortarlo lo dejaria fuera del catalogo y la ausencia no se detectaria. */
++    @Test public void offline_report_no_se_recorta() {
++        assertEquals(LinuxPrinterStatus.base("offline-report"), "offline-report");
++        QueueState q = LinuxPrinterStatus.parse(
++                states("c", LinuxPrinterStatus.STATE_STOPPED),
++                reasons("c", "offline-report")).get("c");
++        assertTrue(q.sinRespuesta());
++    }
++
++    // ---- Fail-safe: sin dato, nada (nunca "presente" por omision) -----------
++
++    @Test public void sin_datos_mapa_vacio() {
++        assertTrue(LinuxPrinterStatus.parse(null, null).isEmpty());
++        assertTrue(LinuxPrinterStatus.parse(new HashMap<>(), null).isEmpty());
++    }
++
++    @Test public void nombres_o_estados_invalidos_se_omiten() {
++        Map<String,Integer> st = new HashMap<>();
++        st.put(null, LinuxPrinterStatus.STATE_IDLE);
++        st.put("",   LinuxPrinterStatus.STATE_IDLE);
++        st.put("sin-estado", null);
++        st.put("buena", LinuxPrinterStatus.STATE_STOPPED);
++        Map<String,QueueState> out = LinuxPrinterStatus.parse(st, null);
++        assertEquals(out.size(), 1);
++        assertTrue(out.get("buena").isStopped());
++    }
++
++    /** Una cola parada SIN razon conocida no puede afirmarse "ausente":
++     *  parada por el administrador (cupsdisable) tambien da state=5. */
++    @Test public void parada_sin_razon_no_afirma_ausencia() {
++        QueueState q = LinuxPrinterStatus.parse(
++                states("c", LinuxPrinterStatus.STATE_STOPPED),
++                reasons("c", "paused")).get("c");
++        assertTrue(q.isStopped());
++        assertFalse(q.sinRespuesta(), "parada != apagada; hacen falta mensajes distintos");
++    }
++}

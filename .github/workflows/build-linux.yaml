@@ -117,18 +117,27 @@ jobs:
           git checkout "$QZ_SOURCE_REF"
           echo "Fuente en $(git rev-parse --short HEAD)"
 
-      # 2b) Aplicar los parches EN ORDEN: 0001 (win) primero, 0002 (linux) después.
-      #     0002 fue generado sobre "pin + 0001", así que este orden es obligatorio.
-      - name: Aplicar parches device path (windows + linux)
+      # 2b) Aplicar los CUATRO parches EN ORDEN. Cada uno se generó sobre el anterior,
+      #     así que el orden es obligatorio:
+      #       0001 win  devicePath/vid/pid por cola y por dispositivo
+      #       0002 linux /dev/usb/lpN real + serial (sysfs) + tofile persistente
+      #       0003 win  workOffline  -> apagado detectado POR COLA (medido 2026-07-22)
+      #       0004 linux printerState + stateReasons (+ media-empty / cover-open gratis)
+      - name: Aplicar parches (devicePath 0001/0002 + estado de cola 0003/0004)
         working-directory: tray
         run: |
-          git apply --check ../this-repo/patches/0001-usb-details-windows-devicepath.patch
-          git apply        ../this-repo/patches/0001-usb-details-windows-devicepath.patch
-          git apply --check ../this-repo/patches/0002-usb-details-linux-devicepath.patch
-          git apply        ../this-repo/patches/0002-usb-details-linux-devicepath.patch
-          echo "Parches 0001 (win) + 0002 (linux) aplicados."
+          for p in 0001-usb-details-windows-devicepath \
+                   0002-usb-details-linux-devicepath \
+                   0003-printer-status-workoffline-windows \
+                   0004-printer-status-cups-linux; do
+            git apply --check "../this-repo/patches/$p.patch"
+            git apply        "../this-repo/patches/$p.patch"
+            echo "  aplicado: $p"
+          done
+          echo "Parches 0001+0002+0003+0004 aplicados."
 
-      # 3) Tests TestNG (incluye LinuxUsbInfoTest y WindowsUsbInfoTest).
+      # 3) Tests TestNG: LinuxUsbInfoTest / WindowsUsbInfoTest (0001/0002) y
+      #    LinuxPrinterStatusTest / WindowsPrinterStatusTest (0003/0004).
       #
       # JDK_JAVAC_OPTIONS: el codigo de impresion de QZ importa DOS paquetes
       # INTERNOS de JavaFX (com.sun.javafx.print y com.sun.javafx.tk, ambos del

@@ -1,5 +1,9 @@
 # Compila el instalador .exe de QZ Tray para Windows en un runner windows-latest
-# de GitHub Actions, aplicando el parche device path USB (patches/0001-...).
+# de GitHub Actions, aplicando los CUATRO parches (patches/0001..0004): device path
+# USB (0001 win / 0002 linux) y estado VIVO de la cola (0003 win workOffline /
+# 0004 linux printerState+stateReasons). Todos son aditivos y solo se activan bajo
+# su SO en runtime, asi que los tres workflows aplican los mismos cuatro y el
+# binario no diverge entre plataformas.
 #
 # Por que existe: el .exe del repo se compilaba a mano en una maquina Windows.
 # Este workflow lo hace reproducible en CI para poder generar el .exe PARCHEADO
@@ -107,14 +111,35 @@ jobs:
           git checkout "$QZ_SOURCE_REF"
           echo "Fuente en $(git rev-parse --short HEAD)"
 
-      # 2b) Aplicar el parche device path USB Windows.
-      - name: Aplicar parche device path Windows
+      # 2b) Aplicar los CUATRO parches EN ORDEN. Cada uno se genero sobre el anterior,
+      #     asi que el orden es obligatorio. Todos son ADITIVOS y su codigo solo se
+      #     ACTIVA en runtime bajo su SO (isWindows()/isLinux()), asi que compilan
+      #     igual en cualquier runner y el binario no diverge entre plataformas.
+      #       0001 win  devicePath/vid/pid por cola y por dispositivo
+      #       0002 linux /dev/usb/lpN real + serial (sysfs) + tofile persistente
+      #       0003 win  workOffline  -> apagado detectado POR COLA (medido 2026-07-22)
+      #       0004 linux printerState + stateReasons (+ media-empty / cover-open)
+      - name: Aplicar parches (devicePath 0001/0002 + estado de cola 0003/0004)
         shell: bash
         working-directory: tray
         run: |
-          git apply --check ../this-repo/patches/0001-usb-details-windows-devicepath.patch
-          git apply        ../this-repo/patches/0001-usb-details-windows-devicepath.patch
-          echo "Parche device path aplicado."
+          for p in 0001-usb-details-windows-devicepath \
+                   0002-usb-details-linux-devicepath \
+                   0003-printer-status-workoffline-windows \
+                   0004-printer-status-cups-linux; do
+            git apply --check "../this-repo/patches/$p.patch"
+            git apply        "../this-repo/patches/$p.patch"
+            echo "  aplicado: $p"
+          done
+          echo "Parches 0001+0002+0003+0004 aplicados."
+
+      # 2c) Tests TestNG: WindowsUsbInfoTest / LinuxUsbInfoTest (0001/0002) y
+      #     WindowsPrinterStatusTest / LinuxPrinterStatusTest (0003/0004).
+      #     El build FALLA si un test cae: el binario no se publica a medias.
+      - name: Tests TestNG
+        shell: bash
+        working-directory: tray
+        run: ant unit-tests
 
       # 3) Copiar el provisioning versionado dentro del arbol tray.
       - name: Colocar provisioning
