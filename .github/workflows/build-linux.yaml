@@ -74,10 +74,20 @@ jobs:
           lfs: false
 
       # Java 11 (liberica), igual que build-win/mac: javac.source/target=11.
+      #
+      # java-package: jdk+fx (Liberica "Full") — OBLIGATORIO aqui. Este workflow es
+      # el unico de los tres que corre `ant unit-tests`, y ese target compila TODO
+      # el arbol, incluido el codigo de impresion de QZ que usa JavaFX
+      # (javafx.print, javafx.util.Pair y hasta la API interna
+      # com.sun.javafx.print). El JDK liberica pelado no trae JavaFX, asi que los
+      # tests morian con 40 errores "package javafx... does not exist" y abortaban
+      # el build ANTES de compilar el .run: por eso qz.run se quedo congelado en el
+      # binario del 16-jul mientras qz.exe (que no corre los tests) si se generaba.
       - uses: actions/setup-java@v4
         with:
           java-version: '11'
           distribution: 'liberica'
+          java-package: 'jdk+fx'
 
       # makeself para empaquetar el .run autoextraíble.
       - name: Instalar herramientas
