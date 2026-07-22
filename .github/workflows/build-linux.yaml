@@ -73,21 +73,37 @@ jobs:
           path: this-repo
           lfs: false
 
-      # Java 11 (liberica), igual que build-win/mac: javac.source/target=11.
+      # DOS JDK 11, a proposito. Este workflow necesita los dos y son incompatibles
+      # entre si, asi que cada paso usa el suyo via JAVA_HOME:
       #
-      # java-package: jdk+fx (Liberica "Full") — OBLIGATORIO aqui. Este workflow es
-      # el unico de los tres que corre `ant unit-tests`, y ese target compila TODO
-      # el arbol, incluido el codigo de impresion de QZ que usa JavaFX
-      # (javafx.print, javafx.util.Pair y hasta la API interna
-      # com.sun.javafx.print). El JDK liberica pelado no trae JavaFX, asi que los
-      # tests morian con 40 errores "package javafx... does not exist" y abortaban
-      # el build ANTES de compilar el .run: por eso qz.run se quedo congelado en el
-      # binario del 16-jul mientras qz.exe (que no corre los tests) si se generaba.
+      #  - jdk+fx (Liberica "Full", con JavaFX) -> COMPILAR. Es el unico de los tres
+      #    workflows que corre `ant unit-tests`, y ese target compila TODO el arbol,
+      #    incluido el codigo de impresion de QZ que importa JavaFX (javafx.print,
+      #    javafx.util.Pair y las internas com.sun.javafx.*). Con el JDK pelado eso
+      #    muere con 40 errores "package javafx... does not exist".
+      #
+      #  - jdk pelado (SIN JavaFX) -> `ant makeself`, que internamente hace jlink.
+      #    QZ empaqueta las clases de JavaFX DENTRO de qz-tray.jar (para correr sobre
+      #    JDKs sin JavaFX). Si el JDK tambien las trae como modulos, jdeps ve el
+      #    mismo paquete en dos sitios: 178 "split package" y "Build step JLINK
+      #    failed". Medido en el run 29929550666.
+      #
+      # El ultimo setup-java es el que deja JAVA_HOME por defecto; por eso el pelado
+      # va el SEGUNDO (es el que usa la mayoria de pasos) y el paso de compilar los
+      # tests apunta al full con JAVA_HOME explicito.
       - uses: actions/setup-java@v4
+        id: jdkfx
         with:
           java-version: '11'
           distribution: 'liberica'
           java-package: 'jdk+fx'
+
+      - uses: actions/setup-java@v4
+        id: jdk
+        with:
+          java-version: '11'
+          distribution: 'liberica'
+          java-package: 'jdk'
 
       # makeself para empaquetar el .run autoextraíble.
       - name: Instalar herramientas
@@ -128,6 +144,8 @@ jobs:
       - name: Tests TestNG
         working-directory: tray
         env:
+          # JDK con JavaFX SOLO aqui (ver el bloque de los dos setup-java).
+          JAVA_HOME: ${{ steps.jdkfx.outputs.path }}
           JDK_JAVAC_OPTIONS: >-
             --add-exports javafx.graphics/com.sun.javafx.print=ALL-UNNAMED
             --add-exports javafx.graphics/com.sun.javafx.tk=ALL-UNNAMED
@@ -166,16 +184,32 @@ jobs:
           fi
 
       # 6) Compilar el instalador .run (target makeself).
+      #
+      # `ant makeself` hace DOS cosas con requisitos de JDK opuestos:
+      #   (a) COMPILA los 246 fuentes -> necesita JavaFX (el JDK full) y el
+      #       desencapsulado de com.sun.javafx.*;
+      #   (b) llama a jlink/jdeps para empaquetar el runtime -> necesita un JDK SIN
+      #       JavaFX. QZ mete las clases de JavaFX dentro de qz-tray.jar, asi que si
+      #       el JDK tambien las trae como modulos, jdeps escupe 178 "split package".
+      #       Y JLink.java trata como ERROR cualquier salida de jdeps que empiece por
+      #       "Warning" (calculateDepList), asi que el build muere con
+      #       "Build step JLINK failed" aunque jdeps haya hecho su trabajo.
+      #
+      # Se resuelve corriendo ant con el JDK full (para (a)) y pasandole a jlink el
+      # JDK pelado con -Djlink.java.target (para (b)): JLink.calculateToolPaths()
+      # usa ESE path para jdeps/jlink en vez del java.home de ant, y ademas se salta
+      # la descarga del JDK del runtime.
       - name: Compilar instalador .run (makeself)
         working-directory: tray
-        # Mismo desencapsulado que en los tests: `ant makeself` depende de
-        # `compile`, que compila las mismas clases que importan com.sun.javafx.*.
         env:
+          JAVA_HOME: ${{ steps.jdkfx.outputs.path }}
           JDK_JAVAC_OPTIONS: >-
             --add-exports javafx.graphics/com.sun.javafx.print=ALL-UNNAMED
             --add-exports javafx.graphics/com.sun.javafx.tk=ALL-UNNAMED
         run: |
           ARGS=(-Dprovision.file=provision/provision.json)
+          # JDK SIN JavaFX para jdeps/jlink (evita los split package).
+          ARGS+=("-Djlink.java.target=${{ steps.jdk.outputs.path }}")
           if [ -n "${{ steps.authcert.outputs.authcert }}" ]; then
             ARGS+=(-Dauthcert.use=cert.pem)
           fi
