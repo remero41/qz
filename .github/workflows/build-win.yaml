@@ -14,8 +14,21 @@
 #   (4) copia el provisioning + (opcional) los certs desde Secrets,
 #   (5) compila con `ant nsis`.
 #
-# Disparo: se lanza en cada push de la rama del parche (para compilar el .exe al
-# subir), y ademas MANUALMENTE (workflow_dispatch) para adjuntarlo a una Release.
+# Disparo: se lanza en cada push de 'main' y de la rama del parche, y ademas
+# MANUALMENTE (workflow_dispatch).
+#
+# PUBLICACION -> LFS de main (2026-07-22). El TPV descarga el instalador de
+#   https://media.githubusercontent.com/media/remero41/qz/main/qz.exe
+# (LFS de main), NO de Releases. Antes este workflow solo subia el .exe como
+# artefacto / a una Release, asi que el binario de main se quedaba congelado en
+# el ultimo build MANUAL: el 16-jul (5ec0d43), ANTERIOR al merge del parche USB
+# (b4a90d9, 21-jul). Resultado medido en Windows real el 22-jul: el QZ instalado
+# desde el modal NO emitia devicePath ni printerClass en usb.listDevices, y como
+# en Windows el bus da serial:"" (el nº de serie va DENTRO del devicePath), la
+# identidad aprobada no casaba y se perdia el USB directo -> el TPV degradaba a
+# cola EN SILENCIO. No era una regresion del TPV: al fix le faltaba el DATO.
+# Por eso el paso "Publicar en LFS de main" commitea aqui el binario recien
+# compilado: es el unico sitio del que el parque descarga.
 #
 # FIRMA:
 #   - Certificado QZ (authcert, confianza sin dialogo): OPCIONAL. Si estan los
@@ -36,6 +49,7 @@ name: build-win
 on:
   push:
     branches:
+      - 'main'
       - 'feat/usb-devicepath-windows'
     paths:
       - 'patches/**'
@@ -47,6 +61,15 @@ on:
         description: 'Adjuntar el .exe a una Release (tag)'
         required: false
         default: ''
+      publicar:
+        description: 'Commitear qz.exe a LFS de main (es lo que descarga el TPV)'
+        type: boolean
+        required: false
+        default: true
+
+# El paso "Publicar en LFS de main" commitea el binario al repo.
+permissions:
+  contents: write
 
 env:
   QZ_SOURCE_REPO: https://github.com/qzind/tray
@@ -57,9 +80,13 @@ jobs:
     runs-on: windows-latest
     steps:
       # 1) Checkout de ESTE repo (provision-src/ + patches/) en subcarpeta.
+      #    lfs:false a proposito: aqui solo se necesitan patches/ y provision-src/,
+      #    y bajar los punteros LFS traeria ~220 MB de binarios inutiles para el
+      #    build. El paso de publicacion hace su propio checkout de main.
       - uses: actions/checkout@v4
         with:
           path: this-repo
+          lfs: false
 
       - uses: actions/setup-java@v4
         with:
@@ -194,3 +221,58 @@ jobs:
         with:
           tag_name: ${{ inputs.release }}
           files: tray/out/qz.exe
+
+      # PUBLICACION: commitea qz.exe al LFS de main, que es de donde descarga el
+      # TPV (zq/printer-modal.js -> QZ_DL.win). Sin este paso, main se queda con
+      # el binario viejo aunque el parche este mergeado: exactamente el fallo del
+      # 22-jul. Se hace en un checkout LIMPIO de main para no arrastrar el arbol
+      # del build ni sus secretos.
+      #
+      # Corre en push a main y en dispatch con publicar=true. Nunca en la rama del
+      # parche: ahi el binario aun no esta validado.
+      #
+      # ANTI-BUCLE (doble): este paso pushea a main, la misma rama que dispara el
+      # workflow. No se reentra porque (1) el commit solo toca qz.exe, que NO esta
+      # en el filtro `paths` de arriba, y (2) GITHUB_TOKEN no dispara workflows por
+      # diseño. Si algun dia se añade 'qz.exe' (o '**') a `paths`, esto se convierte
+      # en un bucle infinito de builds de Windows. NO lo hagas.
+      - name: Publicar en LFS de main
+        if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.publicar) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Checkout limpio de main. lfs:false -> no baja los ~220 MB de binarios
+          # existentes; para AÑADIR un objeto LFS no hace falta tener los demas.
+          git clone --depth 1 --branch main \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" publish
+          cd publish
+          git lfs install --local
+
+          cp ../tray/out/qz.exe qz.exe
+
+          # Si el binario es identico al de main, no se crea commit vacio.
+          if git diff --quiet -- qz.exe; then
+            echo "qz.exe no ha cambiado respecto a main: nada que publicar."
+            exit 0
+          fi
+
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add qz.exe
+
+          # Verificacion ANTES de commitear: qz.exe DEBE quedar como puntero LFS.
+          # Si .gitattributes fallara, se commitearia un binario de 98 MB al arbol
+          # de git (irreversible sin reescribir historia). Preferimos fallar.
+          if ! git show ":qz.exe" | head -c 40 | grep -q 'version https://git-lfs'; then
+            echo "::error::qz.exe NO quedo como puntero LFS. Abortado para no meter 98 MB en el arbol de git."
+            exit 1
+          fi
+
+          # Un -m por parrafo: con un unico -m multilinea, la indentacion del
+          # bloque YAML se colaria dentro del cuerpo del mensaje. (Y un heredoc a
+          # columna 0 romperia el propio `run: |`.)
+          git commit \
+            -m "build(qz): publica qz.exe compilado en CI desde ${GITHUB_SHA:0:7}" \
+            -m "Binario que descarga el TPV (LFS de main). Generado por build-win.yaml. Lleva el parche device path USB (devicePath usbprint + printerClass + ieee1284 en qz.usb.listDevices), imprescindible para el USB directo en Windows: el bus da serial vacio y el numero de serie va dentro del devicePath."
+          git push origin main
+          echo "qz.exe publicado en LFS de main."

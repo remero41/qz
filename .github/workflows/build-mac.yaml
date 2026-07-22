@@ -31,6 +31,15 @@ on:
         description: 'Adjuntar los .pkg a una Release (tag)'
         required: false
         default: ''
+      publicar:
+        description: 'Commitear qz-intel.pkg / qz-arm.pkg a LFS de main (lo que descarga el TPV)'
+        type: boolean
+        required: false
+        default: true
+
+# El paso "Publicar en LFS de main" commitea el binario al repo.
+permissions:
+  contents: write
 
 env:
   # Fuente de QZ y commit EXACTO con el que se compila el parque (v2.2.6 + 24 commits).
@@ -41,8 +50,16 @@ jobs:
   macos:
     runs-on: macos-latest
     strategy:
+      # pkg: nombre FIJO con el que el TPV descarga cada build
+      # (zq/printer-modal.js -> QZ_DL['mac-intel'] / QZ_DL['mac-arm']). Va en la
+      # matriz, y no en una env escrita por un paso, para que sea estatico: asi no
+      # depende del orden de los pasos ni puede llegar vacio a upload-artifact.
       matrix:
-        arch: [x86_64, aarch64]   # Intel + Apple Silicon
+        include:
+          - arch: x86_64    # Intel
+            pkg: qz-intel.pkg
+          - arch: aarch64   # Apple Silicon
+            pkg: qz-arm.pkg
     steps:
       # 1) Checkout de ESTE repo para coger provision-src/.
       #    Se coloca en subcarpeta 'this-repo' para no chocar con el fuente de QZ.
@@ -115,6 +132,20 @@ jobs:
               -Dprovision.file="provision/provision.json"
           ls -la out/*.pkg
 
+      # Nombre FIJO por arquitectura: pkgbuild genera qz-tray-X.Y.Z.pkg, pero el
+      # TPV descarga qz-arm.pkg / qz-intel.pkg (zq/printer-modal.js -> QZ_DL).
+      # Sin este renombrado, lo publicado no casaria con lo que el modal pide.
+      - name: Renombrar .pkg al nombre que descarga el TPV
+        working-directory: tray
+        env:
+          DEST: ${{ matrix.pkg }}
+        run: |
+          set -euo pipefail
+          SRC=$(ls out/*.pkg | head -1)
+          [ -n "$SRC" ] || { echo "::error::no se genero ningun .pkg"; exit 1; }
+          [ "$SRC" = "out/$DEST" ] || mv "$SRC" "out/$DEST"
+          ls -la "out/$DEST"
+
       # No dejar la clave privada en el workspace mas de lo necesario
       - name: Borrar certificados del workspace
         if: always()
@@ -124,7 +155,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: qz-tray-macos-${{ matrix.arch }}
-          path: tray/out/qz-tray-*.pkg
+          path: tray/out/${{ matrix.pkg }}
           if-no-files-found: error
 
       - name: Adjuntar a Release
@@ -132,4 +163,56 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release }}
-          files: tray/out/qz-tray-*.pkg
+          files: tray/out/${{ matrix.pkg }}
+
+      # PUBLICACION: commitea el .pkg al LFS de main, de donde descarga el TPV.
+      # Hoy main NO tiene ningun .pkg, asi que el modal ofrece a los Mac una URL
+      # que da 404. Ver la cabecera de build-win.yaml para el contexto completo.
+      #
+      # CARRERA: los dos jobs de la matriz (intel + arm) publican en main a la vez
+      # y tocan ficheros DISTINTOS, pero comparten rama -> el segundo push es
+      # rechazado por non-fast-forward. Por eso se reintenta con pull --rebase.
+      - name: Publicar en LFS de main
+        if: ${{ inputs.publicar }}
+        env:
+          PKG_NAME: ${{ matrix.pkg }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch main \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" publish
+          cd publish
+          git lfs install --local
+
+          cp "../tray/out/${PKG_NAME}" "${PKG_NAME}"
+
+          if git diff --quiet -- "${PKG_NAME}"; then
+            echo "${PKG_NAME} no ha cambiado respecto a main: nada que publicar."
+            exit 0
+          fi
+
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add "${PKG_NAME}"
+
+          # DEBE quedar como puntero LFS, o meteriamos el .pkg entero en el arbol.
+          if ! git show ":${PKG_NAME}" | head -c 40 | grep -q 'version https://git-lfs'; then
+            echo "::error::${PKG_NAME} NO quedo como puntero LFS. Abortado."
+            exit 1
+          fi
+
+          # Un -m por parrafo (ver build-win.yaml).
+          git commit \
+            -m "build(qz): publica ${PKG_NAME} compilado en CI desde ${GITHUB_SHA:0:7}" \
+            -m "Binario que descarga el TPV (LFS de main). Generado por build-mac.yaml (${{ matrix.arch }})."
+
+          # Reintento por la carrera entre los dos jobs de la matriz.
+          for i in 1 2 3 4 5; do
+            if git push origin main; then
+              echo "${PKG_NAME} publicado en LFS de main."
+              exit 0
+            fi
+            echo "push rechazado (intento $i), rebase y reintento..."
+            git pull --rebase origin main
+          done
+          echo "::error::no se pudo publicar ${PKG_NAME} tras 5 intentos."
+          exit 1
