@@ -98,10 +98,10 @@ jobs:
           done
           echo "Parches 0001+0002+0003+0004 aplicados."
 
-      # 2c) Tests TestNG. El build FALLA si un test cae: no se publica a medias.
-      - name: Tests TestNG
-        working-directory: tray
-        run: ant unit-tests
+      # NOTA: aqui NO se corre `ant unit-tests` (ese target no depende de
+      # download-javafx y el JDK del runner no trae JavaFX -> "package javafx... does
+      # not exist"). Los cuatro tests los valida build-linux, que monta el JDK+fx.
+      # `ant pkgbuild` baja su propia JavaFX y compila el arbol.
 
       # 3) Copiar el provisioning versionado en nuestro repo dentro del arbol tray.
       - name: Colocar provisioning

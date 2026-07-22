@@ -133,13 +133,13 @@ jobs:
           done
           echo "Parches 0001+0002+0003+0004 aplicados."
 
-      # 2c) Tests TestNG: WindowsUsbInfoTest / LinuxUsbInfoTest (0001/0002) y
-      #     WindowsPrinterStatusTest / LinuxPrinterStatusTest (0003/0004).
-      #     El build FALLA si un test cae: el binario no se publica a medias.
-      - name: Tests TestNG
-        shell: bash
-        working-directory: tray
-        run: ant unit-tests
+      # NOTA: aqui NO se corre `ant unit-tests`. Ese target NO depende de
+      # download-javafx, y el JDK de este runner no trae JavaFX -> "package javafx.util
+      # does not exist" (run 29964486867). Quien valida los cuatro tests
+      # (WindowsUsbInfoTest / LinuxUsbInfoTest / WindowsPrinterStatusTest /
+      # LinuxPrinterStatusTest) es build-linux, que si monta el JDK+fx a proposito.
+      # Aqui `ant nsis` baja su propia JavaFX (download-javafx) y compila el arbol;
+      # anadir los tests aqui solo dispara el fallo de arriba sin cubrir nada nuevo.
 
       # 3) Copiar el provisioning versionado dentro del arbol tray.
       - name: Colocar provisioning
