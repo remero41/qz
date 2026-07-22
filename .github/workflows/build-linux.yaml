@@ -113,8 +113,24 @@ jobs:
           echo "Parches 0001 (win) + 0002 (linux) aplicados."
 
       # 3) Tests TestNG (incluye LinuxUsbInfoTest y WindowsUsbInfoTest).
+      #
+      # JDK_JAVAC_OPTIONS: el codigo de impresion de QZ importa DOS paquetes
+      # INTERNOS de JavaFX (com.sun.javafx.print y com.sun.javafx.tk, ambos del
+      # modulo javafx.graphics). El build.xml de upstream no pasa ningun
+      # --add-exports: da por hecho un JDK que trae JavaFX como JARs sueltos en el
+      # classpath (estilo JDK 8), porque hace <fileset dir="${java.home}"
+      # includes="**/*.jar">. Liberica 11 "full" lo trae como MODULOS, que
+      # encapsulan esos paquetes -> "package com.sun.javafx.tk is not visible".
+      #
+      # Se desencapsulan por variable de entorno (mecanismo oficial de Java 9+) en
+      # vez de parchear el build.xml de upstream, que se clona limpio en cada run.
+      # Solo afecta a la compilacion de este paso.
       - name: Tests TestNG
         working-directory: tray
+        env:
+          JDK_JAVAC_OPTIONS: >-
+            --add-exports javafx.graphics/com.sun.javafx.print=ALL-UNNAMED
+            --add-exports javafx.graphics/com.sun.javafx.tk=ALL-UNNAMED
         run: ant unit-tests
 
       # 4) Copiar el provisioning versionado dentro del árbol tray.
@@ -152,6 +168,12 @@ jobs:
       # 6) Compilar el instalador .run (target makeself).
       - name: Compilar instalador .run (makeself)
         working-directory: tray
+        # Mismo desencapsulado que en los tests: `ant makeself` depende de
+        # `compile`, que compila las mismas clases que importan com.sun.javafx.*.
+        env:
+          JDK_JAVAC_OPTIONS: >-
+            --add-exports javafx.graphics/com.sun.javafx.print=ALL-UNNAMED
+            --add-exports javafx.graphics/com.sun.javafx.tk=ALL-UNNAMED
         run: |
           ARGS=(-Dprovision.file=provision/provision.json)
           if [ -n "${{ steps.authcert.outputs.authcert }}" ]; then
