@@ -1,0 +1,126 @@
+diff --git a/test/qz/utils/WindowsQueueIdentityBug33Test.java b/test/qz/utils/WindowsQueueIdentityBug33Test.java
+new file mode 100644
+index 0000000..6ea63b8
+--- /dev/null
++++ b/test/qz/utils/WindowsQueueIdentityBug33Test.java
+@@ -0,0 +1,120 @@
++package qz.utils;
++
++import org.testng.annotations.Test;
++import java.util.*;
++
++import static org.testng.Assert.*;
++
++/**
++ * BUG #33 — la cola de Windows declara la identidad USB de OTRA impresora.
++ *
++ * MEDIDO EN HARDWARE REAL (Windows 11 Pro 10.0.26200, 2026-07-22 y 2026-07-24):
++ * en el equipo del usuario hay DOS aparatos cuyas colas caen sobre puertos
++ * usbprint, y la Brother QL-700 esta DESENCHUFADA con 2 colas instaladas.
++ * `printers.details()` emitia para la cola de la POS58 (ENCENDIDA) el devicePath
++ * y el vid/pid de la Brother (DESCONECTADA).
++ *
++ * CAUSA RAIZ (leida en el codigo, no supuesta):
++ *
++ *   1. `WindowsUsbInfo.parse()` indexa el mapa por MODELO:  out.put(vid+":"+pid, d)
++ *      -> la clave es el par VID:PID, NO el aparato ni el puerto.
++ *   2. `resolvePortToDevice(port, info)` RECORRE los valores de ese mapa y
++ *      devuelve el PRIMERO cuyo `usbPort` coincida. Con dos DeviceInfo que
++ *      declaran el mismo puerto, gana uno ARBITRARIAMENTE (orden de HashMap).
++ *   3. En ningun punto se comprueba si el aparato esta PRESENTE en el bus.
++ *
++ * Consecuencia: un aparato AUSENTE puede usurpar la cola de uno PRESENTE, y el
++ * TPV manda el ticket a una ruta fisica que no existe -> el ticket no sale.
++ *
++ * Este test es el DETECTOR DE MENTIRAS y hoy FALLA a proposito: congela el
++ * comportamiento incorrecto antes de sustituirlo por la via del parche 0005
++ * (`Device Parameters\PortName` explicito + DEVPKEY_Device_Parent + presencia).
++ *
++ * Ver: .memoria_tpv/deteccion-impresora/windows-cruce/INFORME-cruce-cola-usb-windows-2026-07-24.md
++ */
++public class WindowsQueueIdentityBug33Test {
++
++    /** POS58 real del equipo Windows: ENCENDIDA, cola "80" sobre USB002. */
++    private WindowsUsbInfo.DeviceInfo pos58Presente() {
++        WindowsUsbInfo.DeviceInfo d = new WindowsUsbInfo.DeviceInfo();
++        d.vendorId = "0416"; d.productId = "5011";
++        d.printerClass = "usbprint";
++        d.friendlyName = "GD32 Microelectronics POS58 USB Printer";
++        d.usbPort = "USB002";
++        d.devicePath = WindowsUsbInfo.buildDevicePath("0416", "5011", "PRINTER");
++        return d;
++    }
++
++    /** Brother QL-700 real: DESENCHUFADA, pero su nodo sigue en el registro. */
++    private WindowsUsbInfo.DeviceInfo brotherAusente() {
++        WindowsUsbInfo.DeviceInfo d = new WindowsUsbInfo.DeviceInfo();
++        d.vendorId = "04f9"; d.productId = "2042";
++        d.printerClass = "usbprint";
++        d.friendlyName = "Brother QL-700";
++        d.usbPort = "USB002";                  // <-- MISMO puerto: el puerto se REUTILIZA
++        d.devicePath = WindowsUsbInfo.buildDevicePath("04f9", "2042", "000L6Z215703");
++        return d;
++    }
++
++    /**
++     * EL BUG, EN UNA ASERCION.
++     *
++     * Dos aparatos declaran el puerto USB002. Solo la POS58 esta fisicamente
++     * conectada. Preguntar "quien sirve a USB002" debe dar la POS58 SIEMPRE.
++     *
++     * Con el codigo actual el resultado depende del orden de iteracion de un
++     * HashMap: puede devolver la Brother AUSENTE. Se prueban las dos ordenes de
++     * insercion posibles con LinkedHashMap para que el fallo sea DETERMINISTA y
++     * no dependa del hashing (si solo se probara un orden, el test podria pasar
++     * por casualidad — exactamente el falso verde que buscamos evitar).
++     */
++    @Test public void puerto_reutilizado_no_puede_ganar_el_aparato_ausente() {
++        for(boolean ausentePrimero : new boolean[]{ true, false }) {
++            Map<String,WindowsUsbInfo.DeviceInfo> info = new LinkedHashMap<>();
++            if(ausentePrimero) {
++                info.put("04f9:2042", brotherAusente());
++                info.put("0416:5011", pos58Presente());
++            } else {
++                info.put("0416:5011", pos58Presente());
++                info.put("04f9:2042", brotherAusente());
++            }
++
++            WindowsUsbInfo.DeviceInfo r = WindowsUsbInfo.resolvePortToDevice("USB002", info);
++            assertNotNull(r, "USB002 lo sirve la POS58: debe resolver");
++
++            // El corazon del BUG #33: jamas la identidad de un aparato ausente.
++            assertEquals(r.vendorId, "0416",
++                "BUG #33 (orden ausentePrimero=" + ausentePrimero + "): la cola de USB002 "
++                + "devolvio la identidad de la Brother DESENCHUFADA (04f9:2042) en vez de "
++                + "la POS58 encendida (0416:5011)");
++            assertEquals(r.productId, "5011");
++            assertTrue(r.devicePath.contains("VID_0416"),
++                "el devicePath emitido apunta al aparato equivocado: " + r.devicePath);
++        }
++    }
++
++    /**
++     * La otra mitad del bug: hoy NO existe forma de preguntar por la presencia.
++     *
++     * `DeviceInfo` no tiene ningun campo que distinga "esta en el bus" de "su
++     * nodo sigue en el registro". Por eso el dato emitido no puede ser honesto:
++     * una identidad sin presencia es indistinguible de una identidad fantasma.
++     *
++     * Este test documenta el hueco que el parche 0005 debe cerrar (tres estados:
++     * IDENTIFIED / IDENTIFIED_ABSENT / NOT_IDENTIFIABLE).
++     */
++    @Test public void identidad_sin_presencia_no_es_afirmable() {
++        WindowsUsbInfo.DeviceInfo ausente = brotherAusente();
++        boolean tieneCampoDePresencia = false;
++        for(java.lang.reflect.Field f : WindowsUsbInfo.DeviceInfo.class.getFields()) {
++            String n = f.getName().toLowerCase();
++            if(n.contains("present") || n.contains("here") || n.contains("absent")) {
++                tieneCampoDePresencia = true;
++            }
++        }
++        assertTrue(tieneCampoDePresencia,
++            "DeviceInfo emite identidad (" + ausente.vendorId + ":" + ausente.productId
++            + ", devicePath=" + ausente.devicePath + ") SIN poder decir si el aparato esta "
++            + "en el bus. Afirmar identidad de un ausente es el BUG #33.");
++    }
++}
