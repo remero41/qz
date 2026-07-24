@@ -65,10 +65,10 @@ diff --git a/src/qz/printer/PrintServiceMatcher.java b/src/qz/printer/PrintServi
  
 diff --git a/src/qz/utils/WindowsQueueUsbIdentity.java b/src/qz/utils/WindowsQueueUsbIdentity.java
 new file mode 100644
-index 0000000..4677d57
+index 0000000..863981a
 --- /dev/null
 +++ b/src/qz/utils/WindowsQueueUsbIdentity.java
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,387 @@
 +package qz.utils;
 +
 +import java.util.*;
@@ -353,18 +353,29 @@ index 0000000..4677d57
 +        return idx;
 +    }
 +
++    /** CM_LOCATE_DEVNODE_PHANTOM: localiza el devnode AUNQUE el aparato no este
++     *  presente en el bus (apagado/desenchufado). Sin esto, CM_Locate_DevNode con
++     *  flag 0 (NORMAL) solo ve los presentes, y una impresora apagada saldria
++     *  NOT_IDENTIFIABLE en vez de IDENTIFIED_ABSENT -> se perdia la identidad justo
++     *  cuando mas hace falta (avisar de que esta desconectada). MEDIDO 2026-07-24:
++     *  con la POS58 apagada y la Brother desenchufada, el flag 0 devolvia solo la
++     *  POS-80 encendida. */
++    static final int CM_LOCATE_DEVNODE_PHANTOM = 0x00000001;
++
 +    /**
 +     * DEVPKEY_Device_Parent del nodo. No lo expone Advapi32Util (no es un valor
 +     * del registro sino una propiedad de PnP), asi que se va por SetupAPI:
-+     * CM_Locate_DevNodeA + CM_Get_Parent + CM_Get_Device_IDA.
++     * CM_Locate_DevNode(PHANTOM) + CM_Get_Parent + CM_Get_Device_ID.
 +     *
 +     * MEDIDO 2026-07-24 con usuario NO admin: se lee sin privilegios elevados.
++     * PHANTOM es imprescindible: el nodo USBPRINT existe en el registro aunque el
++     * aparato este apagado, pero CM_Locate_DevNode(NORMAL) no lo encontraria.
 +     */
 +    static String leerParent(String instanceId) {
 +        try {
 +            com.sun.jna.platform.win32.Cfgmgr32 cfg = com.sun.jna.platform.win32.Cfgmgr32.INSTANCE;
 +            com.sun.jna.ptr.IntByReference devInst = new com.sun.jna.ptr.IntByReference();
-+            if(cfg.CM_Locate_DevNode(devInst, instanceId, 0) != 0) return null;
++            if(cfg.CM_Locate_DevNode(devInst, instanceId, CM_LOCATE_DEVNODE_PHANTOM) != 0) return null;
 +
 +            com.sun.jna.ptr.IntByReference padre = new com.sun.jna.ptr.IntByReference();
 +            if(cfg.CM_Get_Parent(padre, devInst.getValue(), 0) != 0) return null;
@@ -447,10 +458,10 @@ index 0000000..4677d57
 +}
 diff --git a/test/qz/utils/WindowsQueueUsbIdentityTest.java b/test/qz/utils/WindowsQueueUsbIdentityTest.java
 new file mode 100644
-index 0000000..63246b5
+index 0000000..5f6a7b0
 --- /dev/null
 +++ b/test/qz/utils/WindowsQueueUsbIdentityTest.java
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,248 @@
 +package qz.utils;
 +
 +import org.testng.annotations.Test;
@@ -654,6 +665,49 @@ index 0000000..63246b5
 +        Map<String,List<Nodo>> mapa = indexarPorPuerto(Arrays.asList(
 +                new Nodo(null, P_POS80), new Nodo("", P_POS58)));
 +        assertTrue(mapa.isEmpty());
++    }
++
++    // ---- 6. contrato de la parte IMPURA (fix medido en hardware 24-jul) -----
++
++    /**
++     * BUG DE HARDWARE cazado en vivo el 24-jul: leerParent usaba
++     * CM_Locate_DevNode con flag 0 (NORMAL), que SOLO localiza aparatos
++     * PRESENTES. Con la POS58 apagada y la Brother desenchufada, sus nodos no se
++     * encontraban y las colas salian NOT_IDENTIFIABLE en vez de IDENTIFIED_ABSENT
++     * -> se perdia la identidad justo cuando hace falta para avisar.
++     *
++     * La ejecucion real no es testeable sin Windows, pero SI se puede fijar el
++     * contrato: leerParent DEBE usar PHANTOM; estaVivoEnBus (presencia) NO.
++     * Es un gate: si alguien vuelve a poner flag 0 en leerParent, este test cae.
++     */
++    @Test public void leerParent_usa_PHANTOM_para_ver_aparatos_apagados() throws Exception {
++        String src = new String(java.nio.file.Files.readAllBytes(
++                java.nio.file.Paths.get("src/qz/utils/WindowsQueueUsbIdentity.java")), "UTF-8");
++
++        // Aislar el cuerpo de leerParent para no confundirlo con estaVivoEnBus.
++        int ini = src.indexOf("static String leerParent(");
++        int fin = src.indexOf("private static String leerCadena(");
++        assertTrue(ini > 0 && fin > ini, "no encuentro leerParent");
++        String cuerpo = src.substring(ini, fin);
++
++        assertTrue(cuerpo.contains("CM_LOCATE_DEVNODE_PHANTOM"),
++                "leerParent debe localizar el devnode con PHANTOM: si no, una impresora "
++                + "apagada no da identidad (NOT_IDENTIFIABLE en vez de IDENTIFIED_ABSENT).");
++        assertFalse(cuerpo.matches("(?s).*CM_Locate_DevNode\\([^,]+,[^,]+,\\s*0\\).*"),
++                "leerParent NO puede usar flag 0 (NORMAL): solo veria aparatos presentes.");
++    }
++
++    @Test public void estaVivoEnBus_usa_NORMAL_para_medir_presencia_real() throws Exception {
++        String src = new String(java.nio.file.Files.readAllBytes(
++                java.nio.file.Paths.get("src/qz/utils/WindowsQueueUsbIdentity.java")), "UTF-8");
++        int ini = src.indexOf("static boolean estaVivoEnBus(");
++        assertTrue(ini > 0, "no encuentro estaVivoEnBus");
++        String cuerpo = src.substring(ini);
++
++        // Presencia REAL: aqui SI queremos solo los presentes -> flag 0, NO phantom.
++        assertFalse(cuerpo.contains("CM_LOCATE_DEVNODE_PHANTOM"),
++                "estaVivoEnBus mide PRESENCIA: con PHANTOM daria por presente un aparato "
++                + "apagado y reapareceria el BUG #33 (identidad de un ausente como presente).");
 +    }
 +}
 diff --git a/test/qz/utils/WindowsQueueIdentityBug33Test.java b/test/qz/utils/WindowsQueueIdentityBug33Test.java
