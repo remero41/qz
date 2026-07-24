@@ -1,0 +1,815 @@
+diff --git a/src/qz/printer/PrintServiceMatcher.java b/src/qz/printer/PrintServiceMatcher.java
+--- a/src/qz/printer/PrintServiceMatcher.java
++++ b/src/qz/printer/PrintServiceMatcher.java
+@@ -204,6 +204,16 @@
+         java.util.Map<String,qz.utils.LinuxPrinterStatus.QueueState> cupsState = includeDetails && qz.utils.SystemUtilities.isLinux()
+                 ? qz.utils.LinuxPrinterStatus.readCups() : java.util.Collections.emptyMap();
+ 
++        // Identidad USB por cola en Windows (parche 0005). Se lee UNA sola vez para
++        // todo el listado, como 0003/0004: antes readRegistry() se llamaba DENTRO del
++        // bucle, una vez por impresora.
++        java.util.Map<String,java.util.List<qz.utils.WindowsQueueUsbIdentity.Nodo>> usbNodos =
++                includeDetails && qz.utils.SystemUtilities.isWindows()
++                ? qz.utils.WindowsQueueUsbIdentity.leerNodos() : java.util.Collections.emptyMap();
++        java.util.Set<String> usbPresentes =
++                includeDetails && qz.utils.SystemUtilities.isWindows()
++                ? qz.utils.WindowsQueueUsbIdentity.leerPresentes() : java.util.Collections.emptySet();
++
+         Collection<NativePrinter> nativePrinters = getNativePrinterList().values();
+         if(debug) log.debug("Iterating over all {} discovered printer(s)", nativePrinters.size());
+ 
+@@ -219,15 +229,36 @@
+                 jsonService.put("connection", printer.getConnection());
+                 jsonService.put("default", ps == defaultService);
+ 
+-                // Windows: cruzar la cola con su dispositivo USB (path real + vid/pid). Aditivo:
+-                // si no resuelve, no se añade nada y el TPV degrada a cola.
++                // Windows (parche 0005): identidad USB de ESTA cola.
++                //
++                // SUSTITUYE a WindowsUsbInfo.resolvePortToDevice, que producia el BUG #33
++                // (recorria un mapa indexado por MODELO y se quedaba con el primer nodo que
++                // casara el puerto, sin mirar presencia -> la cola de la POS58 ENCENDIDA
++                // declaraba el devicePath de la Brother DESENCHUFADA). Congelado en
++                // WindowsQueueIdentityBug33Test.
++                //
++                // Ahora el join es EXPLICITO por Device Parameters\PortName y la presencia
++                // es una pregunta SEPARADA, leida del bus vivo.
++                //
++                // ADITIVO y en TRES estados:
++                //   IDENTIFIED        -> vid/pid/serial/devicePath + usbPresent=true
++                //   IDENTIFIED_ABSENT -> los mismos datos + usbPresent=FALSE (identidad
++                //                        conocida de un aparato que NO esta: apagado o fuera)
++                //   NOT_IDENTIFIABLE  -> no se emite NADA (la cola no cuelga de usbprint,
++                //                        p.ej. Epson ESDPRT001) -> el TPV lo trata como
++                //                        indeterminado, nunca como "no hay impresora".
+                 if(qz.utils.SystemUtilities.isWindows()) {
+-                    qz.utils.WindowsUsbInfo.DeviceInfo dev =
+-                            qz.utils.WindowsUsbInfo.resolvePortToDevice(printer.getConnection(), qz.utils.WindowsUsbInfo.readRegistry());
+-                    if(dev != null) {
+-                        if(dev.devicePath != null) jsonService.put("devicePath", dev.devicePath);
+-                        if(dev.vendorId != null)   jsonService.put("vendorId", dev.vendorId);
+-                        if(dev.productId != null)  jsonService.put("productId", dev.productId);
++                    qz.utils.WindowsQueueUsbIdentity.Identidad id =
++                            qz.utils.WindowsQueueUsbIdentity.resolver(printer.getConnection(), usbNodos, usbPresentes);
++                    if(id.hayIdentidad()) {
++                        jsonService.put("vendorId", id.vendorId);
++                        jsonService.put("productId", id.productId);
++                        if(id.serial != null) jsonService.put("serial", id.serial);
++                        if(id.devicePath != null) jsonService.put("devicePath", id.devicePath);
++                        // La presencia va SIEMPRE junto a la identidad: emitir una sin la
++                        // otra es exactamente lo que hacia el BUG #33.
++                        jsonService.put("usbPresent", id.estaPresente());
++                        jsonService.put("serialUnique", id.serialUnica);
+                     }
+                 }
+ 
+diff --git a/src/qz/utils/WindowsQueueUsbIdentity.java b/src/qz/utils/WindowsQueueUsbIdentity.java
+new file mode 100644
+index 0000000..4677d57
+--- /dev/null
++++ b/src/qz/utils/WindowsQueueUsbIdentity.java
+@@ -0,0 +1,376 @@
++package qz.utils;
++
++import java.util.*;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++/**
++ * Identidad USB de una COLA de impresion de Windows (parche 0005).
++ *
++ * Equivalente Windows del `usb://Printer/POS-80?serial=702D07693632` que en
++ * Linux (CUPS) viene dentro del `connection` de la cola. En Windows no existe
++ * ese campo: se reconstruye cruzando
++ *
++ *     cola.PortName (USB00N)
++ *        -> HKLM\SYSTEM\CurrentControlSet\Enum\USBPRINT\...\Device Parameters\PortName
++ *     nodo USBPRINT
++ *        -> DEVPKEY_Device_Parent
++ *     USB\VID_xxxx&PID_xxxx\<serie>
++ *
++ * MEDIDO EN HARDWARE REAL (Windows 11 Pro 10.0.26200, 2026-07-24, usuario NO
++ * administrador):
++ *
++ *   - `Device Parameters\PortName` y `DEVPKEY_Device_Parent` se leen SIN
++ *     privilegios de admin (cero errores en los 3 nodos del equipo). Importaba
++ *     comprobarlo: QZ corre como usuario normal y el parche 0001 ya fallo una
++ *     vez por permisos.
++ *   - El vinculo SOBREVIVE a cambiar la impresora de puerto USB fisico. Probado
++ *     INTERCAMBIANDO la POS-80 y la POS58 de puerto: sus ubicaciones fisicas se
++ *     permutaron y aun asi cada cola siguio apuntando a SU aparato. Si el
++ *     vinculo fuera posicional, las colas se habrian cruzado (= el ticket de la
++ *     venta saliendo por la impresora equivocada).
++ *
++ * ---------------------------------------------------------------------------
++ * POR QUE NO SE REUTILIZA `WindowsUsbInfo.resolvePortToDevice` (BUG #33)
++ * ---------------------------------------------------------------------------
++ * Aquella via MIENTE, y esta congelado en `WindowsQueueIdentityBug33Test`:
++ *
++ *   1. `WindowsUsbInfo.parse()` indexa el mapa por MODELO (vid:pid), no por
++ *      aparato ni por puerto.
++ *   2. `resolvePortToDevice()` RECORRE los valores y devuelve el PRIMERO cuyo
++ *      usbPort coincida -> con dos candidatos gana uno ARBITRARIAMENTE.
++ *   3. No existe ningun concepto de presencia: no puede distinguir "esta en el
++ *      bus" de "su nodo sigue en el registro".
++ *
++ * Resultado medido: la cola de la POS58 ENCENDIDA declaraba el devicePath de la
++ * Brother QL-700 DESENCHUFADA.
++ *
++ * Esta clase hace lo contrario: **join EXPLICITO por PortName** (no recorrido a
++ * ciegas) y **presencia como pregunta separada**, leida del bus vivo.
++ *
++ * ---------------------------------------------------------------------------
++ * TRES ESTADOS, NUNCA DOS
++ * ---------------------------------------------------------------------------
++ * Colapsar "no esta" en "no se sabe" (o al reves) es el antipatron rector de
++ * toda la campana. Por eso el resultado es un enum de tres valores y `valor` no
++ * se puede leer sin mirar `estado`:
++ *
++ *   IDENTIFIED        identidad conocida Y el aparato esta en el bus
++ *   IDENTIFIED_ABSENT identidad conocida, aparato NO presente (apagado/fuera)
++ *   NOT_IDENTIFIABLE  esta cola no cuelga de usbprint: no hay identidad por aqui
++ *
++ * Todo campo es ADITIVO: si no se puede resolver, NO se emite -> el TPV lo trata
++ * como indeterminado, que es como se comporta la flota con QZ sin parchear. La
++ * ausencia del dato NUNCA significa "no hay impresora".
++ */
++public class WindowsQueueUsbIdentity {
++    private static final Logger log = LogManager.getLogger(WindowsQueueUsbIdentity.class);
++
++    /** GUID_DEVINTERFACE_USBPRINT. */
++    public static final String USBPRINT_INTERFACE_GUID = "{28d78fad-5a12-11d1-ae5b-0000f803a8c2}";
++
++    /** DEVPKEY_Device_Parent: "USB\VID_1FC9&PID_2016\702D07693632" */
++    private static final Pattern PARENT =
++            Pattern.compile("USB\\\\VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})\\\\(.+)$");
++
++    /**
++     * Series genericas que NO identifican un aparato concreto. MEDIDO: la POS58
++     * del usuario declara literalmente "Printer".
++     *
++     * OJO — que la serie sea basura NO impide identificar la cola: Windows ata
++     * cola<->aparato por ParentIdPrefix (hash TOPOLOGICO por devnode), no por la
++     * serie. La POS58 se identifica perfectamente. Esto solo marca que la serie
++     * no sirve para distinguir DOS unidades del mismo modelo.
++     */
++    private static final Set<String> SERIE_BASURA = new HashSet<>(Arrays.asList(
++            "printer", "pos", "usb", "device", "serial", "none", "null", "unknown", "0", "000000"));
++
++    public enum Estado { IDENTIFIED, IDENTIFIED_ABSENT, NOT_IDENTIFIABLE }
++
++    /** Un nodo de Enum\USBPRINT ya leido: su PortName explicito y su parent crudo. */
++    public static class Nodo {
++        public final String portName;   // "USB003"
++        public final String parent;     // "USB\VID_1FC9&PID_2016\702D07693632"
++        public Nodo(String portName, String parent) {
++            this.portName = portName;
++            this.parent = parent;
++        }
++    }
++
++    /**
++     * Resultado. `vendorId`/`productId`/`serial`/`devicePath` SOLO son
++     * significativos si `estado != NOT_IDENTIFIABLE`; en ese caso son null.
++     */
++    public static class Identidad {
++        public final Estado estado;
++        public final String vendorId, productId, serial, devicePath;
++        public final boolean serialUnica;
++
++        private Identidad(Estado estado, String vid, String pid, String serial,
++                          String devicePath, boolean serialUnica) {
++            this.estado = estado;
++            this.vendorId = vid;
++            this.productId = pid;
++            this.serial = serial;
++            this.devicePath = devicePath;
++            this.serialUnica = serialUnica;
++        }
++
++        public static Identidad noIdentificable() {
++            return new Identidad(Estado.NOT_IDENTIFIABLE, null, null, null, null, false);
++        }
++
++        /** true solo si el aparato esta REALMENTE en el bus ahora. */
++        public boolean estaPresente() { return estado == Estado.IDENTIFIED; }
++
++        /** true si hay identidad, este o no presente el aparato. */
++        public boolean hayIdentidad() { return estado != Estado.NOT_IDENTIFIABLE; }
++    }
++
++    /** ¿La serie distingue dos unidades del mismo modelo? */
++    public static boolean esSerieUnica(String serial) {
++        if(serial == null) return false;
++        String s = serial.trim();
++        if(s.length() <= 2) return false;
++        return !SERIE_BASURA.contains(s.toLowerCase());
++    }
++
++    /**
++     * Construye el device path de interfaz usbprint.
++     * Formato medido: \\?\USB#VID_1FC9&PID_2016#702D07693632#{28d78fad-...}
++     */
++    public static String buildDevicePath(String vid, String pid, String serial) {
++        if(vid == null || pid == null || serial == null) return null;
++        return "\\\\?\\USB#VID_" + vid.toUpperCase() + "&PID_" + pid.toUpperCase()
++             + "#" + serial + "#" + USBPRINT_INTERFACE_GUID;
++    }
++
++    /**
++     * DECISION PURA — testeable sin Windows. Es el corazon del parche.
++     *
++     * @param portName   puerto de la cola ("USB003", "ESDPRT001", "PORTPROMPT:")
++     * @param porPuerto  indice PortName -> nodos. JOIN EXPLICITO: se busca la
++     *                   clave, NO se recorre el arbol adivinando (esa fue la
++     *                   causa del BUG #33).
++     * @param presentes  InstanceIds USB presentes AHORA en el bus.
++     * @return nunca null; NOT_IDENTIFIABLE si no hay nada que afirmar.
++     */
++    public static Identidad resolver(String portName,
++                                     Map<String,List<Nodo>> porPuerto,
++                                     Set<String> presentes) {
++        if(portName == null || porPuerto == null) return Identidad.noIdentificable();
++
++        List<Nodo> candidatos = porPuerto.get(portName);
++        if(candidatos == null || candidatos.isEmpty()) {
++            // La cola no cuelga de usbprint (Epson ESDPRT001, Print to PDF...).
++            // Es una limitacion MEDIDA, no un fallo.
++            return Identidad.noIdentificable();
++        }
++
++        // Con el puerto reutilizado por varios nodos, gana el que este PRESENTE.
++        // Nunca "el primero": eso es exactamente lo que hacia el codigo del BUG #33.
++        Nodo elegido = null;
++        boolean presente = false;
++        for(Nodo n : candidatos) {
++            if(n == null || n.parent == null) continue;
++            if(estaEnBus(n.parent, presentes)) { elegido = n; presente = true; break; }
++        }
++        if(elegido == null) {
++            for(Nodo n : candidatos) {
++                if(n != null && n.parent != null) { elegido = n; break; }
++            }
++        }
++        if(elegido == null) return Identidad.noIdentificable();
++
++        Matcher m = PARENT.matcher(elegido.parent);
++        if(!m.find()) return Identidad.noIdentificable();
++
++        String vid = m.group(1).toLowerCase();
++        String pid = m.group(2).toLowerCase();
++        String serial = m.group(3);
++
++        // Identidad conocida SIEMPRE; la presencia decide el estado, no si se emite.
++        // Un aparato apagado sigue teniendo identidad: negarla seria colapsar
++        // "no esta" en "no se sabe".
++        return new Identidad(
++                presente ? Estado.IDENTIFIED : Estado.IDENTIFIED_ABSENT,
++                vid, pid, serial,
++                buildDevicePath(vid, pid, serial),
++                esSerieUnica(serial));
++    }
++
++    /**
++     * ¿Esta este InstanceId en el bus?
++     *
++     * GOTCHA MEDIDO 2026-07-24: el bus devuelve la serie en MAYUSCULAS
++     * ("USB\VID_0416&PID_5011\PRINTER") y el registro en la caja original
++     * ("...\Printer"). Con `equals()` la POS58 ENCENDIDA saldria AUSENTE.
++     * La comparacion DEBE ser case-insensitive.
++     */
++    static boolean estaEnBus(String parent, Set<String> presentes) {
++        if(parent == null || presentes == null) return false;
++        String p = parent.toUpperCase();
++        for(String x : presentes) {
++            if(x != null && x.toUpperCase().equals(p)) return true;
++        }
++        return false;
++    }
++
++    /** Indexa nodos por PortName. Varias colas pueden compartir aparato y varios
++     *  nodos pueden declarar el mismo puerto: por eso el valor es una LISTA. */
++    public static Map<String,List<Nodo>> indexarPorPuerto(Collection<Nodo> nodos) {
++        Map<String,List<Nodo>> out = new HashMap<>();
++        if(nodos == null) return out;
++        for(Nodo n : nodos) {
++            if(n == null || n.portName == null || n.portName.trim().isEmpty()) continue;
++            List<Nodo> l = out.get(n.portName);
++            if(l == null) { l = new ArrayList<>(); out.put(n.portName, l); }
++            l.add(n);
++        }
++        return out;
++    }
++
++    // =======================================================================
++    //  LECTURA REAL — todo lo de aqui abajo va detras de isWindows() y es
++    //  fail-safe: ante cualquier error se devuelve vacio y NO se emite campo
++    //  (el TPV degrada a "indeterminado", jamas a "no hay impresora").
++    // =======================================================================
++
++    private static final String ENUM_USBPRINT = "SYSTEM\\CurrentControlSet\\Enum\\USBPRINT";
++
++    /**
++     * Lee Enum\USBPRINT y devuelve el indice PortName -> nodos.
++     *
++     * DIFERENCIA CLAVE CON `WindowsUsbInfo.readUsbprintPorts` (la del BUG #33):
++     * alli se derivaba el puerto del SUFIJO del nombre del nodo y se indexaba
++     * por ParentIdPrefix. Aqui se lee el valor EXPLICITO
++     * `Device Parameters\PortName`, que usbprint.sys graba a proposito, y se
++     * indexa POR PUERTO, que es la pregunta que hace la cola.
++     */
++    public static Map<String,List<Nodo>> leerNodos() {
++        if(!SystemUtilities.isWindows()) return Collections.emptyMap();
++        List<Nodo> nodos = new ArrayList<>();
++        try {
++            for(String modelo : com.sun.jna.platform.win32.Advapi32Util.registryGetKeys(
++                    com.sun.jna.platform.win32.WinReg.HKEY_LOCAL_MACHINE, ENUM_USBPRINT)) {
++                String mbase = ENUM_USBPRINT + "\\" + modelo;
++                String[] hijos;
++                try {
++                    hijos = com.sun.jna.platform.win32.Advapi32Util.registryGetKeys(
++                            com.sun.jna.platform.win32.WinReg.HKEY_LOCAL_MACHINE, mbase);
++                } catch(Exception e) {
++                    log.warn("0005: no puedo leer nodos de USBPRINT\\{}: {}", modelo, e.toString());
++                    continue;
++                }
++                for(String hijo : hijos) {
++                    String nodo = mbase + "\\" + hijo;
++                    String port = leerCadena(nodo + "\\Device Parameters", "PortName");
++                    if(port == null) continue;
++                    String parent = leerParent("USBPRINT\\" + modelo + "\\" + hijo);
++                    if(parent == null) continue;
++                    nodos.add(new Nodo(port, parent));
++                }
++            }
++        } catch(Throwable t) {
++            log.warn("0005: no puedo leer Enum\\USBPRINT (no se emitira identidad por cola): {}", t.toString());
++            return Collections.emptyMap();
++        }
++        Map<String,List<Nodo>> idx = indexarPorPuerto(nodos);
++        log.info("0005: {} nodo(s) usbprint indexados en {} puerto(s)", nodos.size(), idx.size());
++        return idx;
++    }
++
++    /**
++     * DEVPKEY_Device_Parent del nodo. No lo expone Advapi32Util (no es un valor
++     * del registro sino una propiedad de PnP), asi que se va por SetupAPI:
++     * CM_Locate_DevNodeA + CM_Get_Parent + CM_Get_Device_IDA.
++     *
++     * MEDIDO 2026-07-24 con usuario NO admin: se lee sin privilegios elevados.
++     */
++    static String leerParent(String instanceId) {
++        try {
++            com.sun.jna.platform.win32.Cfgmgr32 cfg = com.sun.jna.platform.win32.Cfgmgr32.INSTANCE;
++            com.sun.jna.ptr.IntByReference devInst = new com.sun.jna.ptr.IntByReference();
++            if(cfg.CM_Locate_DevNode(devInst, instanceId, 0) != 0) return null;
++
++            com.sun.jna.ptr.IntByReference padre = new com.sun.jna.ptr.IntByReference();
++            if(cfg.CM_Get_Parent(padre, devInst.getValue(), 0) != 0) return null;
++
++            // CM_Get_Device_ID recibe un Pointer (firma real de JNA 5.17), no un
++            // char[]. Se pide primero el tamaño para no truncar IDs largos.
++            com.sun.jna.ptr.IntByReference tam = new com.sun.jna.ptr.IntByReference();
++            int bytes = (cfg.CM_Get_Device_ID_Size(tam, padre.getValue(), 0) == 0)
++                    ? (tam.getValue() + 1) * 2 : 1024;
++            com.sun.jna.Memory buf = new com.sun.jna.Memory(bytes);
++            if(cfg.CM_Get_Device_ID(padre.getValue(), buf, bytes, 0) != 0) return null;
++            String s = buf.getWideString(0);
++            return (s == null || s.trim().isEmpty()) ? null : s;
++        } catch(Throwable t) {
++            log.warn("0005: no puedo leer el parent de {}: {}", instanceId, t.toString());
++            return null;
++        }
++    }
++
++    private static String leerCadena(String clave, String valor) {
++        try {
++            if(!com.sun.jna.platform.win32.Advapi32Util.registryKeyExists(
++                    com.sun.jna.platform.win32.WinReg.HKEY_LOCAL_MACHINE, clave)) return null;
++            if(!com.sun.jna.platform.win32.Advapi32Util.registryValueExists(
++                    com.sun.jna.platform.win32.WinReg.HKEY_LOCAL_MACHINE, clave, valor)) return null;
++            String s = com.sun.jna.platform.win32.Advapi32Util.registryGetStringValue(
++                    com.sun.jna.platform.win32.WinReg.HKEY_LOCAL_MACHINE, clave, valor);
++            return (s == null || s.trim().isEmpty()) ? null : s;
++        } catch(Exception e) {
++            return null;
++        }
++    }
++
++    /**
++     * InstanceIds USB presentes AHORA en el bus. Identidad y presencia son
++     * preguntas SEPARADAS: la identidad sale del registro (persiste con el
++     * aparato apagado), la presencia del bus vivo.
++     *
++     * Se reutiliza el listado USB que QZ ya sabe hacer; si no hay forma de
++     * mirarlo, se devuelve vacio -> todo saldra IDENTIFIED_ABSENT, nunca
++     * presente por omision.
++     */
++    public static Set<String> leerPresentes() {
++        if(!SystemUtilities.isWindows()) return Collections.emptySet();
++        Set<String> out = new HashSet<>();
++        try {
++            for(String vidpid : com.sun.jna.platform.win32.Advapi32Util.registryGetKeys(
++                    com.sun.jna.platform.win32.WinReg.HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Enum\\USB")) {
++                String base = "SYSTEM\\CurrentControlSet\\Enum\\USB\\" + vidpid;
++                String[] insts;
++                try {
++                    insts = com.sun.jna.platform.win32.Advapi32Util.registryGetKeys(
++                            com.sun.jna.platform.win32.WinReg.HKEY_LOCAL_MACHINE, base);
++                } catch(Exception e) { continue; }
++                for(String inst : insts) {
++                    // Un devnode presente responde a CM_Locate_DevNode con flag
++                    // 0 (solo dispositivos PRESENTES). Los fantasmas del
++                    // registro fallan aqui: es justo la distincion que faltaba.
++                    String id = "USB\\" + vidpid + "\\" + inst;
++                    if(estaVivoEnBus(id)) out.add(id.toUpperCase());
++                }
++            }
++        } catch(Throwable t) {
++            log.warn("0005: no puedo leer la presencia del bus: {}", t.toString());
++            return Collections.emptySet();
++        }
++        return out;
++    }
++
++    /** CM_LOCATE_DEVNODE_NORMAL (0) solo localiza devnodes PRESENTES. */
++    static boolean estaVivoEnBus(String instanceId) {
++        try {
++            com.sun.jna.ptr.IntByReference devInst = new com.sun.jna.ptr.IntByReference();
++            return com.sun.jna.platform.win32.Cfgmgr32.INSTANCE
++                    .CM_Locate_DevNode(devInst, instanceId, 0) == 0;
++        } catch(Throwable t) {
++            return false;
++        }
++    }
++}
+diff --git a/test/qz/utils/WindowsQueueUsbIdentityTest.java b/test/qz/utils/WindowsQueueUsbIdentityTest.java
+new file mode 100644
+index 0000000..63246b5
+--- /dev/null
++++ b/test/qz/utils/WindowsQueueUsbIdentityTest.java
+@@ -0,0 +1,205 @@
++package qz.utils;
++
++import org.testng.annotations.Test;
++import java.util.*;
++
++import static org.testng.Assert.*;
++import static qz.utils.WindowsQueueUsbIdentity.*;
++
++/**
++ * TDD de la parte PURA del parche 0005 (identidad USB por cola en Windows).
++ *
++ * TODOS los fixtures son DATOS REALES, volcados del Windows del usuario el
++ * 2026-07-24 con `zq/dump-0005-win.ps1` (usuario NO admin, cero errores):
++ * ver `.memoria_tpv/deteccion-impresora/windows-cruce/dump-0005-win-2026-07-24.json`.
++ *
++ *   PortName  parent (DEVPKEY_Device_Parent)          cola(s)
++ *   USB001    USB\VID_04F9&PID_2042\000L6Z215703      ticketsraw, "Brother QL-700"  (DESENCHUFADA)
++ *   USB002    USB\VID_0416&PID_5011\Printer           "80"        (POS58, serie basura, ENCENDIDA)
++ *   USB003    USB\VID_1FC9&PID_2016\702D07693632      tickets     (POS-80, ENCENDIDA)
++ *   ESDPRT001 (no cuelga de usbprint)                 ticketepson, EPSON...ReceiptE4
++ */
++public class WindowsQueueUsbIdentityTest {
++
++    // ---- fixtures medidos ---------------------------------------------------
++    private static final String P_BROTHER = "USB\\VID_04F9&PID_2042\\000L6Z215703";
++    private static final String P_POS58   = "USB\\VID_0416&PID_5011\\Printer";
++    private static final String P_POS80   = "USB\\VID_1FC9&PID_2016\\702D07693632";
++
++    /** El bus REAL, tal cual lo devolvio Get-PnpDevice -PresentOnly.
++     *  OJO: la POS58 aparece en MAYUSCULAS (\PRINTER) y el registro dice \Printer. */
++    private Set<String> busReal() {
++        return new HashSet<>(Arrays.asList(
++                "USB\\VID_0416&PID_5011\\PRINTER",          // POS58 encendida (MAYUSCULAS)
++                "USB\\VID_1FC9&PID_2016\\702D07693632",     // POS-80 encendida
++                "USB\\VID_04B8&PID_0202\\J4FF025969",       // Epson (en bus, fuera de usbprint)
++                "USB\\VID_8087&PID_0A2B\\5&1AA452E9&0&7"    // ruido
++                // la Brother 04F9:2042 NO esta: desenchufada
++        ));
++    }
++
++    private Map<String,List<Nodo>> mapaReal() {
++        return indexarPorPuerto(Arrays.asList(
++                new Nodo("USB001", P_BROTHER),
++                new Nodo("USB002", P_POS58),
++                new Nodo("USB003", P_POS80)));
++    }
++
++    // ---- 1. los tres estados, sobre datos reales ---------------------------
++
++    @Test public void pos80_encendida_identificada_y_presente() {
++        Identidad id = resolver("USB003", mapaReal(), busReal());
++        assertEquals(id.estado, Estado.IDENTIFIED);
++        assertEquals(id.vendorId, "1fc9");
++        assertEquals(id.productId, "2016");
++        assertEquals(id.serial, "702D07693632");
++        assertTrue(id.serialUnica);
++        assertTrue(id.estaPresente());
++        assertEquals(id.devicePath,
++                "\\\\?\\USB#VID_1FC9&PID_2016#702D07693632#{28d78fad-5a12-11d1-ae5b-0000f803a8c2}");
++    }
++
++    /**
++     * PRUEBA ADVERSARIAL OBLIGATORIA — el detector de mentiras.
++     *
++     * La Brother esta DESENCHUFADA con 2 colas instaladas. El metodo DEBE darle
++     * identidad correcta Y marcarla AUSENTE. El codigo del BUG #33 la daba por
++     * presente y le entregaba su devicePath a la cola de la POS58.
++     */
++    @Test public void brother_desenchufada_identidad_correcta_pero_AUSENTE() {
++        Identidad id = resolver("USB001", mapaReal(), busReal());
++        assertEquals(id.estado, Estado.IDENTIFIED_ABSENT);
++        assertEquals(id.vendorId, "04f9");
++        assertEquals(id.productId, "2042");
++        assertEquals(id.serial, "000L6Z215703");
++        assertTrue(id.hayIdentidad(), "la identidad se conoce aunque este desenchufada");
++        assertFalse(id.estaPresente(), "MENTIRA: da por presente un aparato desenchufado");
++    }
++
++    /** La Epson va por driver propio (ESDPRT001): limitacion MEDIDA, congelada. */
++    @Test public void epson_esdprt_no_identificable() {
++        Identidad id = resolver("ESDPRT001", mapaReal(), busReal());
++        assertEquals(id.estado, Estado.NOT_IDENTIFIABLE);
++        assertFalse(id.hayIdentidad());
++        assertNull(id.vendorId);
++        assertNull(id.devicePath);
++    }
++
++    @Test public void print_to_pdf_no_identificable() {
++        assertEquals(resolver("PORTPROMPT:", mapaReal(), busReal()).estado, Estado.NOT_IDENTIFIABLE);
++    }
++
++    // ---- 2. el GOTCHA que habria roto la POS58 -----------------------------
++
++    /**
++     * El bus dice "\PRINTER" y el registro "\Printer". Con una comparacion
++     * sensible a mayusculas, la POS58 ENCENDIDA saldria AUSENTE y el TPV diria
++     * "impresora desconectada" con la impresora funcionando delante.
++     */
++    @Test public void pos58_presente_pese_a_diferir_en_mayusculas() {
++        Identidad id = resolver("USB002", mapaReal(), busReal());
++        assertEquals(id.estado, Estado.IDENTIFIED,
++                "el bus da \\PRINTER y el registro \\Printer: la comparacion debe ser case-insensitive");
++        assertTrue(id.estaPresente());
++        assertEquals(id.vendorId, "0416");
++    }
++
++    /** Serie basura ("Printer") NO impide identificar: el vinculo es topologico. */
++    @Test public void pos58_serie_basura_identifica_igual_pero_no_es_unica() {
++        Identidad id = resolver("USB002", mapaReal(), busReal());
++        assertTrue(id.hayIdentidad(), "una serie generica no puede impedir la identificacion");
++        assertEquals(id.serial, "Printer");
++        assertFalse(id.serialUnica, "'Printer' no distingue dos unidades del mismo modelo");
++    }
++
++    @Test public void series_basura_reconocidas() {
++        assertFalse(esSerieUnica("Printer"));
++        assertFalse(esSerieUnica("PRINTER"));
++        assertFalse(esSerieUnica("none"));
++        assertFalse(esSerieUnica("0"));
++        assertFalse(esSerieUnica(null));
++        assertFalse(esSerieUnica("ab"));                 // demasiado corta
++        assertTrue(esSerieUnica("702D07693632"));
++        assertTrue(esSerieUnica("000L6Z215703"));
++    }
++
++    // ---- 3. BUG #33: el puerto reutilizado ---------------------------------
++
++    /**
++     * El nucleo del BUG #33. Dos nodos declaran USB002; solo la POS58 esta en el
++     * bus. Se prueban las DOS ordenes: con "el primero gana" (codigo viejo) una
++     * de ellas devuelve el aparato ausente.
++     */
++    @Test public void puerto_reutilizado_gana_el_PRESENTE_en_cualquier_orden() {
++        for(boolean ausentePrimero : new boolean[]{ true, false }) {
++            List<Nodo> nodos = ausentePrimero
++                    ? Arrays.asList(new Nodo("USB002", P_BROTHER), new Nodo("USB002", P_POS58))
++                    : Arrays.asList(new Nodo("USB002", P_POS58), new Nodo("USB002", P_BROTHER));
++
++            Identidad id = resolver("USB002", indexarPorPuerto(nodos), busReal());
++            assertEquals(id.estado, Estado.IDENTIFIED);
++            assertEquals(id.vendorId, "0416",
++                    "BUG #33 (ausentePrimero=" + ausentePrimero + "): gano el aparato ausente");
++        }
++    }
++
++    /** Si NINGUNO esta presente, hay identidad pero AUSENTE. Nunca "presente". */
++    @Test public void puerto_reutilizado_todos_ausentes_no_inventa_presencia() {
++        Identidad id = resolver("USB002",
++                indexarPorPuerto(Arrays.asList(new Nodo("USB002", P_BROTHER))),
++                new HashSet<String>());   // bus vacio
++        assertEquals(id.estado, Estado.IDENTIFIED_ABSENT);
++        assertFalse(id.estaPresente());
++    }
++
++    // ---- 4. dos colas, un aparato -----------------------------------------
++
++    /** ticketsraw y "Brother QL-700" comparten USB001: ambas resuelven igual. */
++    @Test public void dos_colas_mismo_aparato_resuelven_por_cola() {
++        Map<String,List<Nodo>> mapa = mapaReal();
++        Identidad a = resolver("USB001", mapa, busReal());
++        Identidad b = resolver("USB001", mapa, busReal());
++        assertEquals(a.vendorId, b.vendorId);
++        assertEquals(a.estado, b.estado);
++        assertEquals(a.estado, Estado.IDENTIFIED_ABSENT);
++    }
++
++    // ---- 5. fail-safe: lo desconocido NUNCA se afirma ----------------------
++
++    /**
++     * Puerto que no esta en el indice (p.ej. un USB00N de un puerto nunca visto
++     * en este equipo). LIMITACION DOCUMENTADA: el portatil del usuario solo
++     * tiene 2 puertos, asi que el caso "puerto virgen" NO se pudo medir. El
++     * parche NO adivina: si el nodo no esta, es NOT_IDENTIFIABLE.
++     */
++    @Test public void puerto_desconocido_no_se_adivina() {
++        Identidad id = resolver("USB009", mapaReal(), busReal());
++        assertEquals(id.estado, Estado.NOT_IDENTIFIABLE);
++        assertNull(id.devicePath);
++    }
++
++    @Test public void entradas_nulas_no_revientan_ni_afirman() {
++        assertEquals(resolver(null, mapaReal(), busReal()).estado, Estado.NOT_IDENTIFIABLE);
++        assertEquals(resolver("USB003", null, busReal()).estado, Estado.NOT_IDENTIFIABLE);
++        // sin poder mirar el bus: identidad si, presencia NO
++        Identidad sinBus = resolver("USB003", mapaReal(), null);
++        assertEquals(sinBus.estado, Estado.IDENTIFIED_ABSENT);
++        assertFalse(sinBus.estaPresente(), "sin bus legible jamas se afirma presencia");
++    }
++
++    /** Un parent con formato inesperado no produce una identidad a medias. */
++    @Test public void parent_corrupto_no_produce_identidad_parcial() {
++        Map<String,List<Nodo>> mapa = indexarPorPuerto(Arrays.asList(
++                new Nodo("USB005", "BASURA\\NO_ES_UN_PARENT")));
++        Identidad id = resolver("USB005", mapa, busReal());
++        assertEquals(id.estado, Estado.NOT_IDENTIFIABLE);
++        assertNull(id.vendorId);
++        assertNull(id.devicePath);
++    }
++
++    @Test public void nodos_sin_puerto_se_omiten() {
++        Map<String,List<Nodo>> mapa = indexarPorPuerto(Arrays.asList(
++                new Nodo(null, P_POS80), new Nodo("", P_POS58)));
++        assertTrue(mapa.isEmpty());
++    }
++}
+diff --git a/test/qz/utils/WindowsQueueIdentityBug33Test.java b/test/qz/utils/WindowsQueueIdentityBug33Test.java
+new file mode 100644
+index 0000000..6259d1a
+--- /dev/null
++++ b/test/qz/utils/WindowsQueueIdentityBug33Test.java
+@@ -0,0 +1,151 @@
++package qz.utils;
++
++import org.testng.annotations.Test;
++import java.io.*;
++import java.nio.file.*;
++import java.util.*;
++
++import static org.testng.Assert.*;
++
++/**
++ * BUG #33 — la cola de Windows declaraba la identidad USB de OTRA impresora.
++ *
++ * MEDIDO EN HARDWARE REAL (Windows 11 Pro 10.0.26200, 2026-07-22 y 2026-07-24):
++ * la Brother QL-700 DESENCHUFADA y la POS58 ENCENDIDA compartian puerto logico, y
++ * `printers.details()` emitia para la cola de la POS58 el vid/pid y el devicePath
++ * de la Brother ausente -> el TPV mandaba el ticket a una ruta que no existe.
++ *
++ * CAUSA RAIZ (leida en el codigo, no supuesta):
++ *   1. `WindowsUsbInfo.parse()` indexa por MODELO (out.put(vid+":"+pid, d)), no
++ *      por aparato ni por puerto.
++ *   2. `resolvePortToDevice()` recorre los valores y devuelve el PRIMERO cuyo
++ *      usbPort coincida -> con dos candidatos gana uno ARBITRARIAMENTE.
++ *   3. `DeviceInfo` no tiene concepto de presencia: no puede distinguir "esta en
++ *      el bus" de "su nodo sigue en el registro".
++ *
++ * ---------------------------------------------------------------------------
++ * ESTADO: CERRADO por el parche 0005.
++ * ---------------------------------------------------------------------------
++ * La via defectuosa NO se ha "arreglado": se ha SUSTITUIDO.
++ * `PrintServiceMatcher` ya no llama a `resolvePortToDevice`; ahora usa
++ * `WindowsQueueUsbIdentity`, que hace join EXPLICITO por
++ * `Device Parameters\PortName` y trata la presencia como pregunta separada.
++ *
++ * `WindowsUsbInfo.resolvePortToDevice` sigue existiendo (lo usa el enriquecido
++ * del listado de dispositivos del BUS, donde no hay cruce por puerto y por tanto
++ * no hay bug), pero YA NO decide a que aparato apunta una COLA.
++ *
++ * Por eso este fichero ya no reproduce el fallo — seria un rojo permanente sobre
++ * codigo que nadie ejecuta para esa pregunta. Es un GATE: falla si alguien
++ * vuelve a enchufar la via defectuosa a la emision de identidad por cola.
++ *
++ * Ver: .memoria_tpv/deteccion-impresora/windows-cruce/INFORME-cruce-cola-usb-windows-2026-07-24.md
++ */
++public class WindowsQueueIdentityBug33Test {
++
++    private String fuente(String ruta) throws IOException {
++        Path p = Paths.get(ruta);
++        assertTrue(Files.exists(p), "no encuentro " + ruta);
++        return new String(Files.readAllBytes(p), "UTF-8");
++    }
++
++    /**
++     * EL GATE. `PrintServiceMatcher` NO puede volver a resolver la identidad de
++     * una cola con `resolvePortToDevice`: esa funcion elige por orden de mapa y
++     * sin comprobar presencia.
++     */
++    @Test public void printservicematcher_no_usa_la_via_del_bug33() throws IOException {
++        String src = fuente("src/qz/printer/PrintServiceMatcher.java");
++
++        for(String linea : src.split("\n")) {
++            String l = linea.trim();
++            if(l.startsWith("//") || l.startsWith("*")) continue;   // comentarios: se permiten
++            assertFalse(l.contains("resolvePortToDevice"),
++                    "BUG #33 REINTRODUCIDO: PrintServiceMatcher vuelve a resolver la identidad "
++                    + "de la cola con resolvePortToDevice (elige por orden de HashMap y sin "
++                    + "comprobar presencia). Usa WindowsQueueUsbIdentity.resolver(). Linea: " + l);
++        }
++    }
++
++    /**
++     * La identidad y la presencia deben emitirse JUNTAS. Emitir vid/pid sin decir
++     * si el aparato esta en el bus es la mitad exacta del BUG #33.
++     */
++    @Test public void la_identidad_por_cola_se_emite_con_su_presencia() throws IOException {
++        String src = fuente("src/qz/printer/PrintServiceMatcher.java");
++
++        // OJO: buscar el TEXTO "usbPresent" en todo el fichero NO vale — aparece en
++        // comentarios y en la variable `usbPresentes`, asi que el gate sobrevivia a
++        // borrar la emision de verdad (mutante G2). Hay que exigir la SENTENCIA, y
++        // solo en lineas de codigo.
++        boolean emiteIdentidad = false, emitePresencia = false;
++        for(String linea : src.split("\n")) {
++            String l = linea.trim();
++            if(l.startsWith("//") || l.startsWith("*") || l.startsWith("/*")) continue;
++            if(l.contains("jsonService.put(\"vendorId\"")) emiteIdentidad = true;
++            if(l.contains("jsonService.put(\"usbPresent\"")) emitePresencia = true;
++        }
++
++        assertTrue(src.contains("WindowsQueueUsbIdentity"),
++                "la identidad por cola debe salir de WindowsQueueUsbIdentity (via 0005)");
++        assertTrue(emiteIdentidad, "no se emite vendorId por cola: ¿se retiro el parche 0005?");
++        assertTrue(emitePresencia,
++                "BUG #33: se emite identidad USB por cola SIN emitir su presencia "
++                + "(falta jsonService.put(\"usbPresent\", ...)). Un aparato ausente "
++                + "indistinguible de uno presente es el bug entero.");
++    }
++
++    /**
++     * Documenta POR QUE la via vieja no vale, ejecutandola. No es un rojo: es la
++     * prueba viva de que `resolvePortToDevice` elige arbitrariamente, y de que
++     * por eso no puede decidir sobre colas.
++     *
++     * Si algun dia esa funcion aprendiera a mirar la presencia, este test
++     * fallaria y habria que revisar el gate de arriba (podria dejar de hacer
++     * falta). Falla por MEJORA, nunca por regresion.
++     */
++    @Test public void via_vieja_sigue_eligiendo_a_ciegas_y_por_eso_esta_jubilada() {
++        WindowsUsbInfo.DeviceInfo pos58 = new WindowsUsbInfo.DeviceInfo();
++        pos58.vendorId = "0416"; pos58.productId = "5011"; pos58.usbPort = "USB002";
++        pos58.devicePath = WindowsUsbInfo.buildDevicePath("0416", "5011", "PRINTER");
++
++        WindowsUsbInfo.DeviceInfo brotherAusente = new WindowsUsbInfo.DeviceInfo();
++        brotherAusente.vendorId = "04f9"; brotherAusente.productId = "2042"; brotherAusente.usbPort = "USB002";
++        brotherAusente.devicePath = WindowsUsbInfo.buildDevicePath("04f9", "2042", "000L6Z215703");
++
++        // Mismo puerto, insercion con el ausente primero: gana el ausente.
++        Map<String,WindowsUsbInfo.DeviceInfo> info = new LinkedHashMap<>();
++        info.put("04f9:2042", brotherAusente);
++        info.put("0416:5011", pos58);
++
++        WindowsUsbInfo.DeviceInfo r = WindowsUsbInfo.resolvePortToDevice("USB002", info);
++        assertNotNull(r);
++        assertEquals(r.vendorId, "04f9",
++                "si esto cambia, resolvePortToDevice ya no elige a ciegas: revisa si el gate "
++                + "printservicematcher_no_usa_la_via_del_bug33 sigue siendo necesario");
++
++        // Y no hay forma de saber que ese ganador esta desenchufado.
++        boolean tieneCampoDePresencia = false;
++        for(java.lang.reflect.Field f : WindowsUsbInfo.DeviceInfo.class.getFields()) {
++            String n = f.getName().toLowerCase();
++            if(n.contains("present") || n.contains("here") || n.contains("absent")) tieneCampoDePresencia = true;
++        }
++        assertFalse(tieneCampoDePresencia,
++                "DeviceInfo ya sabe hablar de presencia: reevalua si sigue jubilada");
++    }
++
++    /** La via NUEVA, con el mismo escenario, acierta. Es el contraste directo. */
++    @Test public void via_nueva_acierta_en_el_mismo_escenario() {
++        Map<String,List<WindowsQueueUsbIdentity.Nodo>> mapa =
++                WindowsQueueUsbIdentity.indexarPorPuerto(Arrays.asList(
++                        new WindowsQueueUsbIdentity.Nodo("USB002", "USB\\VID_04F9&PID_2042\\000L6Z215703"),
++                        new WindowsQueueUsbIdentity.Nodo("USB002", "USB\\VID_0416&PID_5011\\Printer")));
++
++        Set<String> bus = new HashSet<>(Arrays.asList("USB\\VID_0416&PID_5011\\PRINTER"));
++
++        WindowsQueueUsbIdentity.Identidad id = WindowsQueueUsbIdentity.resolver("USB002", mapa, bus);
++        assertEquals(id.estado, WindowsQueueUsbIdentity.Estado.IDENTIFIED);
++        assertEquals(id.vendorId, "0416", "la via nueva debe elegir el aparato PRESENTE");
++        assertTrue(id.estaPresente());
++    }
++}

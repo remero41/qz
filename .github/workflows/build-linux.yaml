@@ -129,7 +129,8 @@ jobs:
           for p in 0001-usb-details-windows-devicepath \
                    0002-usb-details-linux-devicepath \
                    0003-printer-status-workoffline-windows \
-                   0004-printer-status-cups-linux; do
+                   0004-printer-status-cups-linux \
+                   0005-queue-usb-identity-windows; do
             git apply --check "../this-repo/patches/$p.patch"
             git apply        "../this-repo/patches/$p.patch"
             echo "  aplicado: $p"
