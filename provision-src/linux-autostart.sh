@@ -13,7 +13,10 @@
 
 set -e
 
-QZ_BIN="/opt/qz-tray/qz-tray"
+# Sobreescribibles por entorno SOLO para poder testear el script contra un
+# sandbox (test/test-linux-autostart.sh). En instalación real nadie las define,
+# así que se comportan igual que las rutas fijas de siempre.
+QZ_BIN="${QZ_BIN:-/opt/qz-tray/qz-tray}"
 if [ ! -x "$QZ_BIN" ]; then
   echo "qz-tray no encontrado en $QZ_BIN; omitiendo servicio systemd."
   exit 0
@@ -27,7 +30,7 @@ fi
 # prefs.properties). QZ regenera ese fichero al arrancar, PERO el parche añadio
 # 'security.print.tofile' a PERSIST_PROPS (Constants.java), asi que ahora QZ la
 # PRESERVA entre arranques. Idempotente.
-QZ_PROPS="/opt/qz-tray/qz-tray.properties"
+QZ_PROPS="${QZ_PROPS:-/opt/qz-tray/qz-tray.properties}"
 if [ -f "$QZ_PROPS" ]; then
   if grep -q '^security.print.tofile=' "$QZ_PROPS" 2>/dev/null; then
     sed -i 's/^security.print.tofile=.*/security.print.tofile=true/' "$QZ_PROPS"
@@ -44,7 +47,6 @@ if [ -z "$TARGET_HOME" ]; then
   echo "No se pudo resolver el HOME de $TARGET_USER; omitiendo."
   exit 0
 fi
-echo "security.print.tofile=true escrito en $QZ_PREFS (USB directo por device path habilitado)."
 
 # --- 1) Desactivar el autostart .desktop de QZ para el usuario (evita duplicado) ---
 # Se hace enmascarándolo con un .desktop "Hidden=true" en el autostart DEL USUARIO,
@@ -70,6 +72,18 @@ After=graphical-session.target
 
 [Service]
 Type=simple
+# Entorno gráfico: systemd sustituye al autostart .desktop, y una unidad de
+# usuario NO hereda el DISPLAY de la sesión. Sin esto AWT no conecta al servidor
+# gráfico y QZ corre SIN icono de bandeja.
+Environment=DISPLAY=:1
+Environment=WAYLAND_DISPLAY=wayland-0
+# Techo de heap: sin -Xmx la JVM se autoasigna 1/4 de la RAM (3,9 GB en 15,7 GB),
+# lo que engorda el RSS y arrastra ~850 MB a swap estando inactiva. SerialGC
+# porque G1 no devuelve memoria al SO en una app que pasa el día parada.
+# Las comillas son OBLIGATORIAS: sin ellas systemd parte el valor por espacios y
+# trata cada trozo como una asignacion aparte, asi que QZ_OPTS llegaria valiendo
+# solo '-Xmx512m' y los otros dos flags se descartarian en SILENCIO.
+Environment="QZ_OPTS=-Xmx512m -XX:+UseSerialGC -XX:MaxMetaspaceSize=128m"
 ExecStart=$QZ_BIN --honorautostart
 # Relanza SOLO en fallo real; NO cuando QZ sale limpio (evita bucle por duplicado).
 Restart=on-failure
