@@ -113,6 +113,60 @@ else
   ko "T1b la unidad exporta WAYLAND_DISPLAY" "necesario en sesiones Wayland (KDE)"
 fi
 
+# --- T1c: el DISPLAY se DERIVA del equipo, no está hardcodeado -------------
+# Un DISPLAY equivocado es un fallo SILENCIOSO: QZ arranca, pero sin icono.
+# El stub de ps finge un Xwayland del usuario en :7 (valor imposible de acertar
+# por casualidad): si la unidad sale con :7, el script lo preguntó de verdad.
+new_sandbox
+cat > "$SANDBOX/bin/ps" <<'PS'
+#!/bin/sh
+echo "/usr/bin/Xwayland :7 -rootless"
+PS
+chmod +x "$SANDBOX/bin/ps"
+invoke_script >/dev/null 2>&1   # invoke_, NO run_: run_script remonta el sandbox y borraría el stub
+if grep -qE '^Environment=DISPLAY=:7$' "$UNIT"; then
+  ok "T1c el DISPLAY se deriva del equipo (no hardcodeado)"
+else
+  ko "T1c el DISPLAY se deriva del equipo (no hardcodeado)" \
+     "unidad trae: $(grep -E '^Environment=DISPLAY=' "$UNIT" 2>/dev/null || echo '(nada)') — en un equipo con otro display no habría icono"
+fi
+
+# --- T1c2: REGRESIÓN medida en kaz -----------------------------------------
+# Coexisten X0 (Xorg del greeter SDDM, de ROOT, socket residual) y X1 (el
+# Xwayland de la sesión real). Elegir "el socket de menor número" da :0, que
+# está muerto para el usuario: el icono no aparecería justo en el equipo donde
+# se midió el fix. Solo cuenta el servidor X DEL USUARIO OBJETIVO.
+new_sandbox
+mkdir -p "$SANDBOX/x11"; : > "$SANDBOX/x11/X0"; : > "$SANDBOX/x11/X1"
+cat > "$SANDBOX/bin/ps" <<'PS'
+#!/bin/sh
+# 'ps -u tester' solo ve los procesos del usuario: el Xorg de root NO sale.
+echo "/usr/bin/Xwayland :1 -rootless -wm 76"
+PS
+chmod +x "$SANDBOX/bin/ps"
+invoke_script >/dev/null 2>&1
+if grep -qE '^Environment=DISPLAY=:1$' "$UNIT"; then
+  ok "T1c2 ignora el X0 residual del greeter y coge el display del usuario"
+else
+  ko "T1c2 ignora el X0 residual del greeter y coge el display del usuario" \
+     "unidad trae: $(grep -E '^Environment=DISPLAY=' "$UNIT" 2>/dev/null || echo '(nada)') — se esperaba :1"
+fi
+
+# --- T1d: sin servidor X detectable, cae a un DISPLAY válido (nunca vacío) --
+# Environment=DISPLAY= (vacío) es peor que no ponerlo: AWT falla igual y el
+# test de presencia T1 pasaría en falso.
+new_sandbox
+# ps mudo A PROPÓSITO: sin stub heredaríamos el ps real de la máquina de test
+# y T1d pasaría por la razón equivocada (viendo el Xwayland de quien lo lanza).
+printf '#!/bin/sh\nexit 0\n' > "$SANDBOX/bin/ps"; chmod +x "$SANDBOX/bin/ps"
+invoke_script >/dev/null 2>&1
+if grep -qE '^Environment=DISPLAY=:[0-9]+$' "$UNIT"; then
+  ok "T1d fallback a un DISPLAY concreto cuando no se detecta servidor X"
+else
+  ko "T1d fallback a un DISPLAY concreto cuando no se detecta servidor X" \
+     "unidad trae: $(grep -E '^Environment=DISPLAY=' "$UNIT" 2>/dev/null || echo '(nada)')"
+fi
+
 # --- T2 (D1/D3): techo de heap ---------------------------------------------
 if grep -qE '^Environment="?QZ_OPTS=.*-Xmx' "$UNIT"; then
   ok "T2 la unidad fija techo de heap (-Xmx)"
