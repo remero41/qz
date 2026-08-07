@@ -48,6 +48,28 @@ if [ -z "$TARGET_HOME" ]; then
   exit 0
 fi
 
+# --- Display gráfico del usuario objetivo ----------------------------------
+# NO se puede hardcodear, y un DISPLAY equivocado es un fallo SILENCIOSO: QZ
+# arranca igual pero AWT no conecta y no hay icono de bandeja.
+#
+# Tampoco vale "el socket de menor número en /tmp/.X11-unix": en kaz coexisten
+# X0 (Xorg del greeter SDDM, de root, un residuo) y X1 (el Xwayland de la
+# sesión real del usuario). El :0 está MUERTO para el usuario y sería la
+# elección equivocada. El discriminante bueno es DE QUIÉN es el servidor X,
+# así que se busca entre los procesos del propio usuario objetivo.
+#
+# Orden: 1) el DISPLAY del proceso Xorg/Xwayland del usuario  2) lo que diga
+# loginctl de su sesión  3) :0 como último recurso.
+TARGET_DISPLAY=$(ps -u "$TARGET_USER" -o args= 2>/dev/null \
+  | sed -n 's/.*[Xx]wayland[[:space:]]\+\(:[0-9]\+\).*/\1/p;s/.*Xorg[[:space:]]\+\(:[0-9]\+\).*/\1/p' \
+  | head -1)
+if [ -z "$TARGET_DISPLAY" ]; then
+  TARGET_DISPLAY=$(loginctl show-user "$TARGET_USER" -p Display --value 2>/dev/null \
+    | xargs -r -I{} loginctl show-session {} -p Display --value 2>/dev/null)
+fi
+[ -z "$TARGET_DISPLAY" ] && TARGET_DISPLAY=":0"
+echo "DISPLAY del servicio: $TARGET_DISPLAY (usuario $TARGET_USER)"
+
 # --- 1) Desactivar el autostart .desktop de QZ para el usuario (evita duplicado) ---
 # Se hace enmascarándolo con un .desktop "Hidden=true" en el autostart DEL USUARIO,
 # que tiene prioridad sobre el de /etc/xdg/autostart. NO borramos el del sistema
@@ -74,8 +96,9 @@ After=graphical-session.target
 Type=simple
 # Entorno gráfico: systemd sustituye al autostart .desktop, y una unidad de
 # usuario NO hereda el DISPLAY de la sesión. Sin esto AWT no conecta al servidor
-# gráfico y QZ corre SIN icono de bandeja.
-Environment=DISPLAY=:1
+# gráfico y QZ corre SIN icono de bandeja. El valor se DERIVA en instalación
+# (loginctl → socket X → :0); no se hardcodea porque varía por equipo.
+Environment=DISPLAY=$TARGET_DISPLAY
 Environment=WAYLAND_DISPLAY=wayland-0
 # Techo de heap: sin -Xmx la JVM se autoasigna 1/4 de la RAM (3,9 GB en 15,7 GB),
 # lo que engorda el RSS y arrastra ~850 MB a swap estando inactiva. SerialGC
