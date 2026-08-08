@@ -22,7 +22,19 @@
 #      real (websocket), relanza si murio, mata+relanza si esta zombi, reactiva
 #      entradas de arranque deshabilitadas, dedupe de instancias.
 #   3) HKLM\...\Run "QZ Tray Watchdog" - +75s -> watchdog. Sobrevive incluso si
-#      el servicio de tareas programadas esta roto.
+#      el servicio de tareas programadas esta roto. El +75s es un Start-Sleep
+#      antepuesto al cuerpo codificado: antes solo estaba en ESTE comentario y
+#      la capa disparaba en t=0, a la vez que el .lnk nativo.
+#
+# TECHO DE HEAP (paridad con la unidad systemd de Linux): se fija QZ_OPTS como
+# variable de MAQUINA. El lanzador de Windows NO es launch4j: es NSIS y lee esa
+# variable (launch.overrides), concatenandola DESPUES de launch.opts. Ver el
+# bloque 1b.
+#
+# FRENO ANTI-BUCLE DEL CASO C: el relanzado por zombi lleva backoff exponencial
+# y se rinde a los 5 intentos, con el contador PERSISTIDO en disco (cada pasada
+# del watchdog es un proceso nuevo). Sin el, un websocket que nunca abre producia
+# mata-relanza cada ~4 min indefinidamente.
 #
 # ANTI-BUCLE (aprendido del bucle de reinicio en Linux, commit e04a799):
 #   - El watchdog RESPETA la preferencia .autostart de QZ: si el usuario apago
@@ -65,15 +77,55 @@ if (-not $exe) {
 $dir = Split-Path -Parent $exe
 Write-Host "QZ localizado en: $exe"
 
+# --- 1b) Techo de heap de la JVM (paridad con la unidad systemd de Linux) ----
+# Sin -Xmx la JVM se autoasigna 1/4 de la RAM (4 GB en un equipo de 16 GB): el
+# RSS engorda, Windows lo pagina estando la app parada, y la PRIMERA impresion
+# tras un rato inactivo va lenta porque hay que traer paginas de disco. Medido
+# en Linux (kaz): swap 1,28 GB -> 0, maj_flt 188.492 -> 464.
+#
+# MECANISMO EN WINDOWS: qz-tray.exe NO es launch4j (creencia previa erronea).
+# Es un lanzador NSIS generado por ant/windows/windows-launcher.nsi.in, que hace:
+#     StrCpy $opts "${launch.opts}"                 ; = "-Xms512m -Djna.nosys=true"
+#     ReadEnvStr $R0 ${launch.overrides}            ; launch.overrides = QZ_OPTS
+#     StrCpy $opts "$opts $R0"                      ; se anade AL FINAL
+# Es decir: lee QZ_OPTS del entorno y lo concatena DESPUES de launch.opts, asi
+# que nuestros flags GANAN. Mecanismo identico al de Linux (unix-launcher.sh.in),
+# solo cambia donde se define la variable.
+#
+# Se escribe como variable de entorno de MAQUINA (HKLM Environment) y no de
+# usuario: el TPV es multiusuario en mostrador y la tarea corre para el grupo
+# Users. Sobrevive a reinstalaciones de QZ (no vive dentro de su carpeta).
+#
+# NO se usa _JAVA_OPTIONS / JAVA_TOOL_OPTIONS: afectarian a TODA JVM del equipo.
+$qzOpts = '-Xmx512m -XX:+UseSerialGC -XX:MaxMetaspaceSize=128m'
+[Environment]::SetEnvironmentVariable('QZ_OPTS', $qzOpts, 'Machine')
+# Y en el proceso actual, para que el primer disparo del watchdog (paso 6) ya
+# arranque QZ con el techo puesto sin esperar a un reinicio: las variables de
+# maquina solo llegan a procesos NUEVOS lanzados tras la difusion del cambio.
+$env:QZ_OPTS = $qzOpts
+Write-Host "Techo de heap fijado: QZ_OPTS=$qzOpts (variable de maquina)"
+
 # --- 2) Cuerpo del watchdog (se ejecutara por -EncodedCommand, sin tocar disco) ---
 # Punto unico de arranque. Para PARAR QZ de verdad: apagar "Iniciar
 # automaticamente" desde el icono de QZ (o deshabilitar la tarea "QZ Tray Watchdog").
 $watchdog = @'
 $ErrorActionPreference = 'SilentlyContinue'
 
-# Mutex global: si otro watchdog esta en marcha, salir (anti-solape entre capas)
+# Mutex global: si otro watchdog esta en marcha, salir (anti-solape entre capas).
+#
+# El WaitOne va en try/catch por AbandonedMutexException: si una pasada anterior
+# murio sin liberar el mutex (proceso matado, ExecutionTimeLimit del Task
+# Scheduler, apagon), .NET lo entrega ABANDONADO lanzando esa excepcion. Sin
+# tratarla, la excepcion tumba la pasada ANTES de entrar al try/finally y el
+# watchdog queda mudo pasada tras pasada: QZ podria estar caido y nadie lo
+# relanzaria (el fallo mas grave posible, porque es SILENCIOSO).
+# Mutex abandonado = el anterior ya no existe => nos lo quedamos y seguimos.
 $mutex = New-Object System.Threading.Mutex($false, 'Global\QZTrayWatchdog')
-if (-not $mutex.WaitOne(0)) { exit 0 }
+$owned = $false
+try   { $owned = $mutex.WaitOne(0) }
+catch [System.Threading.AbandonedMutexException] { $owned = $true }
+catch { $owned = $false }
+if (-not $owned) { exit 0 }
 try {
 
 $log = Join-Path $env:LOCALAPPDATA 'qz-watchdog.log'
@@ -120,13 +172,85 @@ if (Test-QzAutostartWanted) {
   }
 }
 
+# --- Puertos a sondear -------------------------------------------------------
+# Los 8 por defecto (Constants.DEFAULT_WSS_PORTS = 8181,8282,8383,8484 seguros +
+# los inseguros +1) son SOLO el default: WebsocketPorts.java lee las prefs
+# websocket.secure.ports / websocket.insecure.ports, asi que un equipo con otra
+# configuracion tendria a QZ escuchando fuera de la lista fija. Con la lista fija
+# la sonda daria FALSO NEGATIVO: se declara zombi un QZ perfectamente sano y se
+# lo mata cada pocos minutos. Se leen las prefs y se anaden a los defaults.
+function Get-QzPorts {
+  $ports = [System.Collections.Generic.List[int]]::new()
+  foreach ($p in 8181,8282,8383,8484,8182,8283,8384,8485) { [void]$ports.Add($p) }
+  $prefFiles = @(
+    (Join-Path $env:APPDATA     'qz\prefs.properties'),
+    (Join-Path $env:PROGRAMDATA 'qz\prefs.properties'),
+    (Join-Path (Split-Path -Parent $exe) 'qz-tray.properties')
+  )
+  foreach ($f in $prefFiles) {
+    if (-not (Test-Path $f)) { continue }
+    foreach ($line in (Get-Content -Path $f -ErrorAction SilentlyContinue)) {
+      if ($line -match '^\s*websocket\.(secure|insecure)\.ports\s*=\s*(.+)$') {
+        foreach ($tok in ($matches[2] -split '[,;\s]+')) {
+          $n = 0
+          if ([int]::TryParse($tok.Trim(), [ref]$n) -and $n -gt 0 -and $n -lt 65536) {
+            if (-not $ports.Contains($n)) { [void]$ports.Add($n) }
+          }
+        }
+      }
+    }
+  }
+  return $ports
+}
+
 # Sonda de salud: escucha el websocket de QZ en algun puerto conocido?
+#
+# NO basta con que el puerto acepte conexion: cualquier OTRO programa que ocupe
+# el 8181 haria que un QZ MUERTO se declarase vivo (falso POSITIVO), nadie lo
+# relanzaria y el TPV no imprimiria — y ademas en silencio. Se exige que el
+# proceso DUENO del puerto sea uno de los qz-tray que estamos vigilando.
+# Get-NetTCPConnection no abre sockets: no hay espera de 800 ms por puerto, asi
+# que la pasada tampoco puede tardar 6,4 s como la sonda anterior.
 function Test-QzAlive {
-  foreach ($port in 8181,8282,8383,8484,8182,8283,8384,8485) {
+  param([int[]]$QzPids)
+
+  $ports = Get-QzPorts
+
+  # Camino bueno: mirar quien tiene el puerto en LISTEN (Windows 8+/2012+).
+  $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+                 Where-Object { $ports -contains $_.LocalPort })
+  if ($listeners.Count -gt 0) {
+    foreach ($l in $listeners) {
+      if ($QzPids -contains [int]$l.OwningProcess) { return $true }
+    }
+    # Los puertos estan tomados pero por OTRO proceso: QZ no esta escuchando.
+    return $false
+  }
+
+  # Fallback (Get-NetTCPConnection ausente o sin permisos): netstat -ano, que da
+  # igualmente el PID dueno. Solo si el camino bueno no devolvio NADA.
+  $netstat = @(netstat -ano 2>$null | Select-String 'LISTENING')
+  if ($netstat.Count -gt 0) {
+    foreach ($row in $netstat) {
+      $f = ($row.ToString() -split '\s+') | Where-Object { $_ }
+      if ($f.Count -lt 5) { continue }
+      $localPort = 0
+      $portTok = ($f[1] -split ':')[-1]
+      if (-not [int]::TryParse($portTok, [ref]$localPort)) { continue }
+      if (-not ($ports -contains $localPort)) { continue }
+      $owner = 0
+      if ([int]::TryParse($f[-1], [ref]$owner) -and ($QzPids -contains $owner)) { return $true }
+    }
+    return $false
+  }
+
+  # Ultimo recurso: sin forma de saber el dueno, sonda TCP a secas (el
+  # comportamiento antiguo). Peor, pero mejor que declarar zombi sin motivo.
+  foreach ($port in $ports) {
     $tcp = New-Object Net.Sockets.TcpClient
     try {
       $async = $tcp.BeginConnect('127.0.0.1', $port, $null, $null)
-      if ($async.AsyncWaitHandle.WaitOne(800) -and $tcp.Connected) { return $true }
+      if ($async.AsyncWaitHandle.WaitOne(300) -and $tcp.Connected) { return $true }
     } catch {} finally { $tcp.Close() }
   }
   return $false
@@ -135,8 +259,54 @@ function Test-QzAlive {
 # Lanza QZ con --honorautostart (misma semantica que el .lnk nativo): si el
 # usuario apago el autostart, el propio QZ se autocierra sin abrir puerto y ya
 # no lo tocamos (Test-QzAutostartWanted nos habra frenado antes de llegar aqui).
+# -WindowStyle Hidden explicito: en un mostrador, una ventana que aparece y
+# desaparece cada pocos minutos es lo que mas molesta al usuario. qz-tray.exe es
+# GUI, pero el lanzador NSIS puede materializar consola segun variante y no
+# cuesta nada dejarlo dicho.
 function Start-Qz {
-  Start-Process -FilePath $exe -ArgumentList '--honorautostart' -WorkingDirectory (Split-Path -Parent $exe)
+  Start-Process -FilePath $exe -ArgumentList '--honorautostart' `
+                -WorkingDirectory (Split-Path -Parent $exe) -WindowStyle Hidden
+}
+
+# --- Freno del relanzado (estado PERSISTENTE en disco) -----------------------
+# Cada pasada del watchdog es un proceso PowerShell NUEVO: un contador en
+# variable no frena nada. El estado vive en un fichero junto al log.
+#
+# BUG QUE ARREGLA: el caso C (proceso vivo, websocket muerto) mataba y relanzaba
+# sin contador ni tope. Si el websocket NUNCA llega a abrir —puerto ocupado por
+# otra aplicacion, firewall, QZ escuchando fuera de los puertos sondeados, JVM
+# que revienta al arrancar— el relanzado RESETEA el StartTime, asi que 4 minutos
+# despues se vuelve a cumplir la condicion: mata-relanza CADA ~4-6 MINUTOS,
+# INDEFINIDAMENTE. Ese es justo el ciclo abrir-cerrar que el script decia evitar.
+#
+# Politica: backoff exponencial (4, 8, 16, 32... min, tope 60) y RENDICION tras
+# 5 intentos fallidos seguidos. Rendirse es lo correcto: si 5 reinicios no han
+# abierto el websocket, el problema no lo arregla un sexto, y un QZ vivo aunque
+# sin websocket molesta menos que un mata-relanza perpetuo. Cualquier pasada que
+# vea a QZ sano borra el estado, asi que el freno se rearma solo (autocuracion).
+# Espeja StartLimitBurst=5 de la unidad systemd de Linux.
+$stateFile = Join-Path $env:LOCALAPPDATA 'qz-watchdog-state.txt'
+
+function Get-RestartState {
+  # Devuelve @{ Count = n; Last = [datetime] }; ceros si no hay estado.
+  $st = @{ Count = 0; Last = [datetime]::MinValue }
+  if (Test-Path $stateFile) {
+    $raw = (Get-Content -Path $stateFile -TotalCount 1 -ErrorAction SilentlyContinue)
+    if ($raw -and ($raw -match '^\s*(\d+)\s*\|\s*(.+?)\s*$')) {
+      $st.Count = [int]$matches[1]
+      $parsed = [datetime]::MinValue
+      if ([datetime]::TryParse($matches[2], [ref]$parsed)) { $st.Last = $parsed }
+    }
+  }
+  return $st
+}
+
+function Set-RestartState($count) {
+  Set-Content -Path $stateFile -Value ("{0}|{1}" -f $count, (Get-Date).ToString('o')) -ErrorAction SilentlyContinue
+}
+
+function Clear-RestartState {
+  if (Test-Path $stateFile) { Remove-Item $stateFile -Force -ErrorAction SilentlyContinue }
 }
 
 $procs = @(Get-Process qz-tray -ErrorAction SilentlyContinue)
@@ -172,12 +342,32 @@ if ($procs.Count -gt 1) {
   }
 }
 
-if (Test-QzAlive) { return }   # sano: silencio total
+# Sano: silencio total. Y ademas se REARMA el freno: cualquier pasada que vea a
+# QZ funcionando borra el contador de reintentos (autocuracion).
+if (Test-QzAlive -QzPids @($procs | ForEach-Object { $_.Id })) {
+  Clear-RestartState
+  return
+}
 
 # Caso C: proceso vivo pero sin websocket. Puede ser JVM fria (arranque) o zombi.
 # Damos 4 min de gracia desde el arranque del MAS RECIENTE antes de actuar.
 $newest = ($procs | Sort-Object StartTime -Descending | Select-Object -First 1).StartTime
 if ($newest -and ((Get-Date) - $newest).TotalMinutes -lt 4) { return }
+
+# FRENO ANTI-BUCLE: backoff exponencial + rendicion a los 5 intentos.
+$state = Get-RestartState
+if ($state.Count -ge 5) {
+  # Rendido. Se registra UNA sola vez cada hora para no engordar el log con 720
+  # lineas al dia repitiendo lo mismo.
+  if (((Get-Date) - $state.Last).TotalMinutes -ge 60) {
+    Log 'RENDIDO: 5 reintentos sin que el websocket abra. No se relanza mas (revisar puerto ocupado/firewall/prefs). Se rearmara solo en cuanto QZ vuelva a responder.'
+    Set-RestartState 5
+  }
+  return
+}
+# Backoff: 4, 8, 16, 32, 60 min desde el ultimo intento.
+$waitMin = [Math]::Min(60, 4 * [Math]::Pow(2, $state.Count))
+if ($state.Count -gt 0 -and ((Get-Date) - $state.Last).TotalMinutes -lt $waitMin) { return }
 
 # Zombi confirmado: matar TODO qz-tray, esperar a que muera de verdad, y relanzar
 # UNA vez. Esperar evita el solape (proceso agonizando + nuevo = doble instancia).
@@ -187,7 +377,8 @@ while ((Get-Process qz-tray -ErrorAction SilentlyContinue) -and (Get-Date) -lt $
   Start-Sleep -Milliseconds 500
 }
 Start-Qz
-Log 'QZ zombi (proceso vivo, websocket muerto); reiniciado'
+Set-RestartState ($state.Count + 1)
+Log ("QZ zombi (proceso vivo, websocket muerto); reiniciado (intento {0}/5)" -f ($state.Count + 1))
 return
 
 } finally { $mutex.ReleaseMutex() }
@@ -199,8 +390,19 @@ $ps  = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe
 $wdArgs = "-NoProfile -WindowStyle Hidden -EncodedCommand $b64"
 
 # --- 3) Capa 3: HKLM Run -> watchdog con retardo (sobrevive a un Task Scheduler roto) ---
+#
+# EL RETARDO ES REAL, NO SOLO DOCUMENTAL. La cabecera de este script describia
+# esta capa como "+75s" y la capa 1 como "+45s" para escalonar el arranque, pero
+# el valor de Run se registraba SIN espera alguna: se disparaba en t=0, a la vez
+# que el .lnk nativo de QZ. Dos lanzamientos simultaneos son justo la carrera de
+# doble instancia que el escalonamiento pretendia evitar (la JVM tarda segundos
+# en enlazar el puerto, y el SingleInstanceChecker de QZ no cubre ese margen).
+# Se antepone un Start-Sleep de 75 s al cuerpo del watchdog para ESTA capa; asi
+# el orden real queda .lnk (t=0) -> tarea ONLOGON (+45 s) -> HKLM Run (+75 s), y
+# cuando llega esta ultima el caso B ya tiene con que decidir.
 $runKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
-$runCmd = "`"$ps`" -NoProfile -WindowStyle Hidden -EncodedCommand $b64"
+$b64Run = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("Start-Sleep -Seconds 75`r`n$watchdog"))
+$runCmd = "`"$ps`" -NoProfile -WindowStyle Hidden -EncodedCommand $b64Run"
 New-ItemProperty -Path $runKey -Name 'QZ Tray Watchdog' -Value $runCmd -PropertyType String -Force | Out-Null
 # Retirar entrada HKLM Run directa de versiones previas (evita doble lanzamiento)
 Remove-ItemProperty -Path $runKey -Name 'QZ Tray' -ErrorAction SilentlyContinue
