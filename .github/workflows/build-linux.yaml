@@ -299,5 +299,19 @@ jobs:
           git commit \
             -m "build(qz): publica qz.run compilado en CI desde ${GITHUB_SHA:0:7}" \
             -m "Binario que descarga el TPV (LFS de main). Generado por build-linux.yaml. Lleva los parches 0001 (win) + 0002 (linux): LinuxUsbInfo resuelve el /dev/usb/lpN real + serial por sysfs, que es lo que consume el USB directo."
-          git push origin main
-          echo "qz.run publicado en LFS de main."
+          # CARRERA ENTRE WORKFLOWS: ver el comentario extenso en build-win.yaml.
+          # Resumen: un push a main dispara build-win y build-linux a la vez, los
+          # dos terminan aqui con un clon de ANTES de que el otro publicara, y al
+          # segundo le rechazan el push por non-fast-forward. El binario del
+          # perdedor no llega a main y el parque se queda con el viejo EN SILENCIO.
+          # El rebase no puede dar conflicto: cada workflow toca SU fichero.
+          for i in 1 2 3 4 5; do
+            if git push origin main; then
+              echo "qz.run publicado en LFS de main."
+              exit 0
+            fi
+            echo "push rechazado (intento $i), rebase y reintento..."
+            git pull --rebase origin main
+          done
+          echo "::error::no se pudo publicar qz.run tras 5 intentos."
+          exit 1

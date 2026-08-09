@@ -300,5 +300,27 @@ jobs:
           git commit \
             -m "build(qz): publica qz.exe compilado en CI desde ${GITHUB_SHA:0:7}" \
             -m "Binario que descarga el TPV (LFS de main). Generado por build-win.yaml. Lleva el parche device path USB (devicePath usbprint + printerClass + ieee1284 en qz.usb.listDevices), imprescindible para el USB directo en Windows: el bus da serial vacio y el numero de serie va dentro del devicePath."
-          git push origin main
-          echo "qz.exe publicado en LFS de main."
+          # CARRERA ENTRE WORKFLOWS: un push a main dispara build-win y build-linux
+          # A LA VEZ. Ambos tardan ~3 min, ambos terminan aqui, y el clon de cada
+          # uno es de ANTES de que el otro publicara -> al segundo le rechazan el
+          # push por non-fast-forward y este paso FALLA. El binario del perdedor NO
+          # llega a main, que es de donde descarga el TPV, asi que el parque se
+          # queda con el viejo EN SILENCIO. Medido dos veces: el 07-ago gano
+          # build-linux y el qz.exe quedo 2 dias sin publicar pese a haber
+          # compilado bien; el 09-ago gano build-win y se quedo sin publicar el
+          # qz.run. Ojo al leer el resultado: el job sale 'failure' pero el .exe SI
+          # compilo, lo unico que falla es este ultimo paso.
+          #
+          # El rebase no puede dar conflicto real: cada workflow toca SU fichero
+          # (qz.exe / qz.run / qz-*.pkg). Mismo patron que build-mac.yaml, donde ya
+          # existia por la carrera entre sus dos jobs de matriz (intel + arm).
+          for i in 1 2 3 4 5; do
+            if git push origin main; then
+              echo "qz.exe publicado en LFS de main."
+              exit 0
+            fi
+            echo "push rechazado (intento $i), rebase y reintento..."
+            git pull --rebase origin main
+          done
+          echo "::error::no se pudo publicar qz.exe tras 5 intentos."
+          exit 1
