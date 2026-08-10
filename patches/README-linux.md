@@ -57,3 +57,25 @@ como base, copiar encima los 5 ficheros del árbol de trabajo, `git diff --cache
   0002 solo añade lectura de sysfs en `listDevices` (bajo petición del cliente, no en arranque).
 - **CI:** `.github/workflows/build-linux.yaml` clona el pin, aplica 0001+0002, corre `ant unit-tests`
   y compila el `.run` con `ant makeself` (Java 11 liberica, igual que win/mac).
+
+## 0006 — Timeout en escritura a fichero/device (`printToFile`)
+
+**Bug cazado en vivo (kim, 2026-08-10):** con la impresora sin consumir datos (apagada a
+mitad de job, en error, buffer lleno), `printToFile` se quedaba bloqueado PARA SIEMPRE en
+`FileOutputStream.write()` **reteniendo `/dev/usb/lpN`**. `usblp` solo admite un abridor:
+todos los trabajos posteriores (de cualquier proceso) morían con «Device or resource busy»
+hasta reiniciar QZ, y el TPV solo veía un spinner infinito. Medido con `fuser`: el `java`
+de QZ era quien retenía el device.
+
+**Fix:** la escritura pasa a `FileChannel` (canal interrumpible) con un watchdog que cierra
+el canal al vencer el timeout (`-Dqz.print.tofile.timeout`, 30 s por defecto, ajustable vía
+`QZ_OPTS`): la escritura bloqueada aborta con `IOException` clara («the device is not
+consuming data»), el descriptor se libera solo y el error llega al TPV por el websocket
+(`PrintException`). Cerrar un canal interrumpible SÍ desbloquea un `write()` clavado en el
+kernel (señal → EINTR), cosa que un `close()` normal desde otro hilo no garantiza. Mismos
+flags de apertura que `FileOutputStream` (WRITE|CREATE|TRUNCATE): el camino feliz no cambia.
+
+**Test:** `PrintRawToFileTimeoutTest` reproduce el secuestro con un FIFO cuyo lector no
+consume (misma syscall bloqueada) y afirma: aborta al vencer (no antes, no eternamente),
+mensaje explicativo, y camino feliz intacto (escribe y trunca igual). Se regenera desde
+`pin+0001..0005`, solo toca `PrintRaw.java` + test nuevo.

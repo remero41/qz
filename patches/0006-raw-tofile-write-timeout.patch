@@ -1,0 +1,212 @@
+diff --git a/src/qz/printer/action/PrintRaw.java b/src/qz/printer/action/PrintRaw.java
+index f0cd975..71376f1 100644
+--- a/src/qz/printer/action/PrintRaw.java
++++ b/src/qz/printer/action/PrintRaw.java
+@@ -37,10 +37,17 @@ import javax.print.event.PrintJobListener;
+ import java.awt.image.BufferedImage;
+ import java.io.*;
+ import java.net.Socket;
++import java.nio.ByteBuffer;
++import java.nio.channels.ClosedChannelException;
++import java.nio.channels.FileChannel;
++import java.nio.file.StandardOpenOption;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.Timer;
++import java.util.TimerTask;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ /**
+@@ -234,6 +241,20 @@ public class PrintRaw implements PrintProcessor {
+      *
+      * @param file File to be written
+      */
++    /**
++     * Seconds before a blocked file/device write is aborted, releasing the descriptor.
++     * Overridable via <code>-Dqz.print.tofile.timeout=N</code> (e.g. through <code>QZ_OPTS</code>).
++     * <p>
++     * A stalled device write (e.g. /dev/usb/lpN with the printer off, in error, or not
++     * consuming data) would otherwise block FOREVER while holding the descriptor: the
++     * usblp driver only allows one opener, so every later job — from any process — fails
++     * with "Device or resource busy" until QZ is restarted. A healthy receipt printer
++     * drains its buffer in well under a second; 30s only ever expires on a dead device.
++     */
++    private static int fileWriteTimeoutSecs() {
++        return Integer.getInteger("qz.print.tofile.timeout", 30);
++    }
++
+     private void printToFile(File file, byte[] cmds, boolean locationRestricted) throws IOException {
+         if(file == null) throw new IOException("No file specified");
+ 
+@@ -245,9 +266,41 @@ public class PrintRaw implements PrintProcessor {
+ 
+         log.debug("Printing to file: {}", file.getName());
+ 
+-        //throws any exception and auto-closes stream
+-        try(OutputStream out = new FileOutputStream(file)) {
+-            out.write(cmds);
++        // FileChannel (interruptible) instead of FileOutputStream, with a watchdog that
++        // closes the channel when the timeout expires: closing an interruptible channel
++        // aborts a write blocked inside the kernel (the blocked thread gets
++        // AsynchronousCloseException), which a plain OutputStream.close() from another
++        // thread cannot guarantee. Same open flags as FileOutputStream (WRITE|CREATE|TRUNCATE).
++        try(FileChannel channel = FileChannel.open(file.toPath(), StandardOpenOption.WRITE,
++                                                   StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
++            int timeoutSecs = fileWriteTimeoutSecs();
++            Timer watchdog = new Timer("qz-tofile-watchdog", true);
++            AtomicBoolean expired = new AtomicBoolean(false);
++            watchdog.schedule(new TimerTask() {
++                @Override
++                public void run() {
++                    expired.set(true);
++                    try { channel.close(); } catch(IOException ignore) {}
++                }
++            }, TimeUnit.SECONDS.toMillis(timeoutSecs));
++            try {
++                ByteBuffer buffer = ByteBuffer.wrap(cmds);
++                while(buffer.hasRemaining()) {
++                    channel.write(buffer);
++                }
++            }
++            catch(ClosedChannelException e) {
++                // Covers AsynchronousCloseException (watchdog) and ClosedByInterruptException
++                if (expired.get()) {
++                    throw new IOException(String.format("Timeout (%ds) writing to '%s': the device is not consuming data " +
++                            "(printer off, in error state, or held by another job). The descriptor has been released.",
++                            timeoutSecs, file), e);
++                }
++                throw e;
++            }
++            finally {
++                watchdog.cancel();
++            }
+         }
+     }
+ 
+diff --git a/test/qz/printer/action/PrintRawToFileTimeoutTest.java b/test/qz/printer/action/PrintRawToFileTimeoutTest.java
+new file mode 100644
+index 0000000..6979a7c
+--- /dev/null
++++ b/test/qz/printer/action/PrintRawToFileTimeoutTest.java
+@@ -0,0 +1,118 @@
++package qz.printer.action;
++
++import org.testng.SkipException;
++import org.testng.annotations.AfterMethod;
++import org.testng.annotations.Test;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++
++import static org.testng.Assert.*;
++
++/**
++ * BUG cazado en vivo (kim, 2026-08-10): una escritura a /dev/usb/lpN con la
++ * impresora sin consumir datos (apagada a mitad de job, en error, buffer lleno)
++ * se quedaba bloqueada PARA SIEMPRE dentro de FileOutputStream.write(),
++ * reteniendo el descriptor. El driver usblp solo admite UN abridor, así que
++ * todos los trabajos posteriores — de cualquier proceso — morían con "Device or
++ * resource busy" hasta reiniciar QZ, sin ningún error visible para el TPV
++ * (spinner infinito).
++ *
++ * El fix: printToFile escribe por FileChannel con un watchdog que cierra el
++ * canal al vencer el timeout (-Dqz.print.tofile.timeout, 30s por defecto):
++ * la escritura bloqueada aborta con IOException clara y el device se libera.
++ *
++ * Se reproduce con un FIFO cuyo lector NO consume: tras llenar el buffer del
++ * pipe (64 KiB), write() se bloquea en el kernel exactamente igual que con la
++ * impresora atascada.
++ */
++public class PrintRawToFileTimeoutTest {
++
++    private static final String TIMEOUT_PROP = "qz.print.tofile.timeout";
++
++    private FileInputStream fifoReader;
++    private File fifo;
++
++    @AfterMethod
++    public void cleanup() throws Exception {
++        System.clearProperty(TIMEOUT_PROP);
++        if (fifoReader != null) { fifoReader.close(); fifoReader = null; }
++        if (fifo != null) { fifo.delete(); fifo = null; }
++    }
++
++    private static Object invokePrintToFile(File file, byte[] cmds) throws Throwable {
++        Method m = PrintRaw.class.getDeclaredMethod("printToFile", File.class, byte[].class, boolean.class);
++        m.setAccessible(true);
++        try {
++            // locationRestricted=false: mismo camino que los temp files, sin depender de prefs
++            return m.invoke(new PrintRaw(), file, cmds, false);
++        }
++        catch(InvocationTargetException e) {
++            throw e.getCause();
++        }
++    }
++
++    @Test(timeOut = 30_000)
++    public void escritura_bloqueada_vence_por_timeout_y_libera_el_descriptor() throws Throwable {
++        if (!System.getProperty("os.name").toLowerCase().contains("linux")) {
++            throw new SkipException("Reproducción con FIFO: solo Linux");
++        }
++
++        fifo = new File(Files.createTempDirectory("qz-tofile-test").toFile(), "fifo-impresora-atascada");
++        Process mkfifo = new ProcessBuilder("mkfifo", fifo.getAbsolutePath()).start();
++        assertEquals(mkfifo.waitFor(), 0, "mkfifo falló");
++
++        // Lector que ABRE pero NUNCA consume (la "impresora atascada"). El open de
++        // lectura se bloquea hasta que printToFile abra el extremo de escritura.
++        CountDownLatch readerUp = new CountDownLatch(1);
++        Thread reader = new Thread(() -> {
++            try {
++                fifoReader = new FileInputStream(fifo);
++                readerUp.countDown();
++            } catch(IOException ignore) {}
++        }, "lector-que-no-consume");
++        reader.setDaemon(true);
++        reader.start();
++
++        System.setProperty(TIMEOUT_PROP, "2");
++        byte[] megaTicket = new byte[1024 * 1024]; // > 64 KiB del buffer del pipe → write() se clava
++
++        long start = System.nanoTime();
++        try {
++            invokePrintToFile(fifo, megaTicket);
++            fail("La escritura bloqueada debería haber vencido por timeout");
++        }
++        catch(IOException e) {
++            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
++            assertTrue(e.getMessage().contains("Timeout (2s)"),
++                       "El error debe explicar el timeout al TPV; fue: " + e.getMessage());
++            // Antes del fix esto se quedaba colgado PARA SIEMPRE (el timeOut de
++            // TestNG lo mataría). Acotado = el descriptor se ha soltado.
++            assertTrue(elapsedMs >= 1500 && elapsedMs < 15_000,
++                       "Debe abortar al vencer el timeout (2s), no antes ni eternamente; tardó " + elapsedMs + "ms");
++        }
++        assertTrue(readerUp.await(1, TimeUnit.SECONDS), "el lector llegó a abrir el FIFO");
++    }
++
++    @Test(timeOut = 30_000)
++    public void escritura_normal_sigue_intacta_y_trunca_como_fileoutputstream() throws Throwable {
++        File normal = File.createTempFile("qz_raw_", null);
++        try {
++            // Contenido previo MÁS LARGO: verifica la semántica TRUNCATE de FileOutputStream
++            Files.write(normal.toPath(), "contenido-previo-mucho-mas-largo".getBytes(StandardCharsets.UTF_8));
++
++            invokePrintToFile(normal, "ticket".getBytes(StandardCharsets.UTF_8));
++
++            assertEquals(new String(Files.readAllBytes(normal.toPath()), StandardCharsets.UTF_8), "ticket");
++        } finally {
++            normal.delete();
++        }
++    }
++}
