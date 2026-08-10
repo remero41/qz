@@ -30,6 +30,29 @@ ant makeself -Dauthcert.use="cert.pem" -Dprovision.file="provision/provision.jso
 > lo que **borra el binario del otro SO**. Compila uno, **copia su binario a sitio
 > seguro**, y luego compila el otro. No los encadenes esperando ambos en `out/` a la vez.
 
+## Arranque BLINDADO en Linux (linux-autostart.sh)
+
+Regla de oro (medida en vivo en kim, 2026-08-10): **QZ solo arranca DENTRO de una
+sesión gráfica viva**. Una instancia sin sesión no muestra icono ni atiende al
+navegador, pero **ocupa el 8181** y bloquea a la instancia buena.
+
+- **Servicio systemd de usuario** enganchado a `graphical-session.target`
+  (`After`+`PartOf`+`WantedBy`); **sin linger** (era lo que arrancaba QZ al boot
+  sin sesión). `Restart=on-failure`: solo revive ante crash real.
+- **Wrapper de guard** (`/opt/qz-tray/qz-tray-session.sh`): deriva
+  `DISPLAY`/`WAYLAND_DISPLAY` en **runtime** (el X0 residual del greeter no cuenta:
+  se busca el servidor X **del usuario**) y, si no hay sesión gráfica, **sale
+  limpio sin lanzar QZ** (el 8181 queda libre).
+- **Autostarts `.desktop` neutralizados** (el del usuario con override
+  `Hidden=true` y el de `/etc/xdg/autostart` in situ): el servicio es el ÚNICO
+  lanzador; sin esto había 2 iconos/instancias (kim, 20-07 y 10-08).
+- **Grupo `lp`**: `/dev/usb/lpN` es `root:lp 660`; el instalador añade el usuario
+  real (`SUDO_USER` → `logname` → sesión de `loginctl`) al grupo `lp`.
+  ⚠️ **Hace falta cerrar e iniciar sesión** (o reiniciar) para que el grupo surta
+  efecto; hasta entonces el USB directo da «Permiso denegado».
+
+Tests (sin root, sandbox completo): `bash test/test-linux-autostart.sh`.
+
 ## Arranque BLINDADO en Windows (win-autostart.ps1 v2)
 
 El objetivo es que QZ arranque **sí o sí** al encender el PC, con recuperación
