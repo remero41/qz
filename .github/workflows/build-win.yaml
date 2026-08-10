@@ -127,12 +127,13 @@ jobs:
                    0002-usb-details-linux-devicepath \
                    0003-printer-status-workoffline-windows \
                    0004-printer-status-cups-linux \
-                   0005-queue-usb-identity-windows; do
+                   0005-queue-usb-identity-windows \
+                   0006-raw-tofile-write-timeout; do
             git apply --check "../this-repo/patches/$p.patch"
             git apply        "../this-repo/patches/$p.patch"
             echo "  aplicado: $p"
           done
-          echo "Parches 0001+0002+0003+0004 aplicados."
+          echo "Parches 0001..0006 aplicados."
 
       # NOTA: aqui NO se corre `ant unit-tests`. Ese target NO depende de
       # download-javafx, y el JDK de este runner no trae JavaFX -> "package javafx.util
