@@ -28,7 +28,7 @@
     "data": "win-cleanup.ps1"
   },
   {
-    "description": "Arranque blindado QZ (servicio systemd Restart=always)",
+    "description": "Arranque blindado QZ (servicio systemd solo en sesion grafica + grupo lp + autostarts neutralizados)",
     "type": "Script",
     "phase": "install",
     "os": "linux",

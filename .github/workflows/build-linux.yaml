@@ -270,6 +270,14 @@ jobs:
         if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.publicar) }}
         run: |
           set -euo pipefail
+          # GATE authcert: el binario que se publica es el que instala TODA la
+          # flota. Sin cert embebido, cada instalación nueva vería el popup
+          # "Untrusted website" en cada impresión. Compilar sin cert sigue
+          # valiendo para PROBAR (artefacto), pero publicar a main NO.
+          if [ -z "${{ steps.authcert.outputs.authcert }}" ]; then
+            echo "::error::qz.run se compiló SIN authcert (faltan Secrets QZ_CERT_PEM/QZ_KEY_PEM/QZ_OVERRIDE_CRT). No se publica a la flota."
+            exit 1
+          fi
           git clone --depth 1 --branch main \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" publish
           cd publish
