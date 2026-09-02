@@ -1,0 +1,152 @@
+diff --git a/src/qz/printer/action/PrintRaw.java b/src/qz/printer/action/PrintRaw.java
+--- a/src/qz/printer/action/PrintRaw.java
++++ b/src/qz/printer/action/PrintRaw.java
+@@ -255,6 +255,36 @@
+         return Integer.getInteger("qz.print.tofile.timeout", 30);
+     }
+ 
++    /**
++     * True when the target is a Windows DEVICE path ({@code \\.\...} or {@code \\?\...})
++     * rather than a regular file - e.g. the usbprint path
++     * {@code \\.\USB#VID_xxxx&PID_yyyy#instance#{GUID}\dummy} used for direct USB
++     * receipt printing.
++     * <p>
++     * REGRESSION FIXED HERE (measured in production, albasushilab 2026-09-02): patch 0006
++     * swapped FileOutputStream for FileChannel.open(WRITE, CREATE, TRUNCATE_EXISTING),
++     * claiming those were the "same open flags as FileOutputStream". They are NOT, and on
++     * Windows two of them are illegal on a device:
++     * <ul>
++     *   <li>CREATE maps to CreateFile(OPEN_ALWAYS) - a device cannot be created;</li>
++     *   <li>TRUNCATE_EXISTING issues SetEndOfFile, which the usbprint driver does not
++     *       implement, returning ERROR_INVALID_FUNCTION (1).</li>
++     * </ul>
++     * Java surfaces that as {@code java.nio.file.FileSystemException: ...\dummy:
++     * Funcion incorrecta} - i.e. EVERY direct-USB receipt failed, on every Windows till,
++     * from the moment patch 0006 shipped. It went unnoticed because these flags are
++     * harmless on Linux (the kernel ignores O_TRUNC on a character device), which is the
++     * only platform patch 0006's own test covers.
++     * <p>
++     * The distinction is the TARGET, not the OS: only a real file can be created or
++     * truncated. Devices are opened WRITE-only, exactly as FileOutputStream did before.
++     */
++    static boolean isDevicePath(File file) {
++        if(file == null) { return false; }
++        String p = file.getPath();
++        return p.startsWith("\\\\.\\") || p.startsWith("\\\\?\\");
++    }
++
+     private void printToFile(File file, byte[] cmds, boolean locationRestricted) throws IOException {
+         if(file == null) throw new IOException("No file specified");
+ 
+@@ -270,9 +300,15 @@
+         // closes the channel when the timeout expires: closing an interruptible channel
+         // aborts a write blocked inside the kernel (the blocked thread gets
+         // AsynchronousCloseException), which a plain OutputStream.close() from another
+-        // thread cannot guarantee. Same open flags as FileOutputStream (WRITE|CREATE|TRUNCATE).
+-        try(FileChannel channel = FileChannel.open(file.toPath(), StandardOpenOption.WRITE,
+-                                                   StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
++        // thread cannot guarantee. Same open flags as FileOutputStream (WRITE|CREATE|TRUNCATE)
++        // ...EXCEPT on a device path, where CREATE/TRUNCATE_EXISTING are illegal and make
++        // the open itself fail with "Funcion incorrecta" (see isDevicePath). A device is
++        // opened WRITE-only; the watchdog below is unaffected and still protects it.
++        StandardOpenOption[] openOpts = isDevicePath(file)
++                ? new StandardOpenOption[] {StandardOpenOption.WRITE}
++                : new StandardOpenOption[] {StandardOpenOption.WRITE, StandardOpenOption.CREATE,
++                                            StandardOpenOption.TRUNCATE_EXISTING};
++        try(FileChannel channel = FileChannel.open(file.toPath(), openOpts)) {
+             int timeoutSecs = fileWriteTimeoutSecs();
+             Timer watchdog = new Timer("qz-tofile-watchdog", true);
+             AtomicBoolean expired = new AtomicBoolean(false);
+diff --git a/test/qz/printer/action/PrintRawDevicePathFlagsTest.java b/test/qz/printer/action/PrintRawDevicePathFlagsTest.java
+new file mode 100644
+--- /dev/null
++++ b/test/qz/printer/action/PrintRawDevicePathFlagsTest.java
+@@ -0,0 +1,88 @@
++package qz.printer.action;
++
++import org.testng.annotations.Test;
++
++import java.io.File;
++import java.lang.reflect.Method;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++
++import static org.testng.Assert.*;
++
++/**
++ * REGRESION DE PRODUCCION (albasushilab, 2026-09-02, medida por AnyDesk): desde que salio
++ * el parche 0006, TODA impresion por USB directo en Windows moria con
++ *
++ *   java.nio.file.FileSystemException:
++ *     \\?\USB#VID_003&PID_0369#PP5800#{28d78fad-...}\dummy: Funcion incorrecta
++ *
++ * El 0006 cambio FileOutputStream por FileChannel.open(WRITE, CREATE, TRUNCATE_EXISTING)
++ * afirmando que eran "las mismas flags que FileOutputStream". No lo son: sobre un DEVICE
++ * de Windows, CREATE (OPEN_ALWAYS) y TRUNCATE_EXISTING (SetEndOfFile) son ilegales y el
++ * driver usbprint devuelve ERROR_INVALID_FUNCTION -> "Funcion incorrecta".
++ *
++ * Paso inadvertido porque en Linux esas flags son inocuas (el kernel ignora O_TRUNC sobre
++ * un device de caracter), y el unico test del 0006 se salta Windows con SkipException.
++ *
++ * Estos tests son de PLATAFORMA NEUTRA: comprueban la DECISION de flags, que es donde
++ * esta el defecto, sin necesitar una impresora ni un Windows real.
++ */
++public class PrintRawDevicePathFlagsTest {
++
++    private static boolean esDevice(String path) throws Exception {
++        Method m = PrintRaw.class.getDeclaredMethod("isDevicePath", File.class);
++        m.setAccessible(true);
++        return (Boolean)m.invoke(null, new File(path));
++    }
++
++    /** El path EXACTO de la captura del cliente y los que construye el parche 0001. */
++    @Test
++    public void device_paths_de_usbprint_se_reconocen_como_device() throws Exception {
++        assertTrue(esDevice("\\\\?\\USB#VID_003&PID_0369#PP5800#{28d78fad-5a12-11d1-ae5b-0000f803a8c2}\\dummy"),
++                   "el path de la incidencia real (prefijo \\\\?\\) es un device");
++        assertTrue(esDevice("\\\\.\\USB#VID_0416&PID_5011#PRINTER#{28d78fad-5a12-11d1-ae5b-0000f803a8c2}\\dummy"),
++                   "el path que construye buildDevicePath del parche 0001 es un device");
++        assertTrue(esDevice("\\\\.\\USB#VID_1FC9&PID_2016#702D07693632#{28d78fad-5a12-11d1-ae5b-0000f803a8c2}\\dummy"),
++                   "device con serial legitimo");
++    }
++
++    /**
++     * Un fichero normal NO debe perder CREATE/TRUNCATE: los temp files de PrintRaw y el
++     * "tofile persistente" del parche 0002 dependen de que se cree y se trunque.
++     */
++    @Test
++    public void ficheros_normales_no_se_confunden_con_devices() throws Exception {
++        assertFalse(esDevice("/tmp/qz_raw_123.tmp"), "ruta unix normal");
++        assertFalse(esDevice("/dev/usb/lp0"),
++                    "el device de Linux NO lleva prefijo Windows: sigue por la rama de fichero, como hasta ahora");
++        assertFalse(esDevice("C:\\Users\\caja\\ticket.bin"), "ruta Windows normal");
++        assertFalse(esDevice("\\\\servidor\\compartido\\ticket.bin"), "UNC de red no es un device");
++    }
++
++    /**
++     * El contrato que el 0006 si respetaba y no se puede perder al arreglar el device:
++     * escribir a un fichero normal sigue TRUNCANDO (semantica de FileOutputStream).
++     */
++    @Test
++    public void escritura_a_fichero_normal_sigue_truncando() throws Throwable {
++        File f = File.createTempFile("qz_raw_", null);
++        try {
++            Files.write(f.toPath(), "contenido-previo-mucho-mas-largo".getBytes(StandardCharsets.UTF_8));
++            Method m = PrintRaw.class.getDeclaredMethod("printToFile", File.class, byte[].class, boolean.class);
++            m.setAccessible(true);
++            m.invoke(new PrintRaw(), f, "ticket".getBytes(StandardCharsets.UTF_8), false);
++            assertEquals(new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8), "ticket",
++                         "un fichero normal debe truncarse, no quedar con restos del anterior");
++        } finally {
++            f.delete();
++        }
++    }
++
++    /** Guarda de fondo: null no puede colarse como device. */
++    @Test
++    public void null_no_es_device() throws Exception {
++        Method m = PrintRaw.class.getDeclaredMethod("isDevicePath", File.class);
++        m.setAccessible(true);
++        assertFalse((Boolean)m.invoke(null, new Object[] {null}));
++    }
++}

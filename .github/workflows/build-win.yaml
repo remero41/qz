@@ -1,9 +1,10 @@
 # Compila el instalador .exe de QZ Tray para Windows en un runner windows-latest
-# de GitHub Actions, aplicando los CUATRO parches (patches/0001..0004): device path
-# USB (0001 win / 0002 linux) y estado VIVO de la cola (0003 win workOffline /
-# 0004 linux printerState+stateReasons). Todos son aditivos y solo se activan bajo
-# su SO en runtime, asi que los tres workflows aplican los mismos cuatro y el
-# binario no diverge entre plataformas.
+# de GitHub Actions, aplicando los SIETE parches (patches/0001..0007): device path
+# USB (0001 win / 0002 linux), estado VIVO de la cola (0003 win workOffline /
+# 0004 linux printerState+stateReasons), identidad USB por cola (0005 win) y la
+# escritura raw a fichero/device (0006 timeout + 0007 flags de apertura del device).
+# Todos son aditivos y solo se activan bajo su SO en runtime, asi que los tres
+# workflows aplican los mismos siete y el binario no diverge entre plataformas.
 #
 # Por que existe: el .exe del repo se compilaba a mano en una maquina Windows.
 # Este workflow lo hace reproducible en CI para poder generar el .exe PARCHEADO
@@ -111,7 +112,7 @@ jobs:
           git checkout "$QZ_SOURCE_REF"
           echo "Fuente en $(git rev-parse --short HEAD)"
 
-      # 2b) Aplicar los CUATRO parches EN ORDEN. Cada uno se genero sobre el anterior,
+      # 2b) Aplicar los SIETE parches EN ORDEN. Cada uno se genero sobre el anterior,
       #     asi que el orden es obligatorio. Todos son ADITIVOS y su codigo solo se
       #     ACTIVA en runtime bajo su SO (isWindows()/isLinux()), asi que compilan
       #     igual en cualquier runner y el binario no diverge entre plataformas.
@@ -128,12 +129,13 @@ jobs:
                    0003-printer-status-workoffline-windows \
                    0004-printer-status-cups-linux \
                    0005-queue-usb-identity-windows \
-                   0006-raw-tofile-write-timeout; do
+                   0006-raw-tofile-write-timeout \
+                   0007-raw-tofile-device-open-flags; do
             git apply --check "../this-repo/patches/$p.patch"
             git apply        "../this-repo/patches/$p.patch"
             echo "  aplicado: $p"
           done
-          echo "Parches 0001..0006 aplicados."
+          echo "Parches 0001..0007 aplicados."
 
       # NOTA: aqui NO se corre `ant unit-tests`. Ese target NO depende de
       # download-javafx, y el JDK de este runner no trae JavaFX -> "package javafx.util

@@ -80,7 +80,7 @@ jobs:
           git checkout "$QZ_SOURCE_REF"
           echo "Fuente en $(git rev-parse --short HEAD)"
 
-      # 2b) Aplicar los CUATRO parches EN ORDEN (cada uno se generó sobre el anterior).
+      # 2b) Aplicar los SIETE parches EN ORDEN (cada uno se generó sobre el anterior).
       #     Todos son aditivos y su código solo se ACTIVA en runtime bajo su SO
       #     (isWindows()/isLinux()), así que compilan igual en el build de Mac.
       #       0001 win  devicePath/vid/pid · 0002 linux /dev/usb/lpN + serial
@@ -93,12 +93,13 @@ jobs:
                    0003-printer-status-workoffline-windows \
                    0004-printer-status-cups-linux \
                    0005-queue-usb-identity-windows \
-                   0006-raw-tofile-write-timeout; do
+                   0006-raw-tofile-write-timeout \
+                   0007-raw-tofile-device-open-flags; do
             git apply --check "../this-repo/patches/$p.patch"
             git apply        "../this-repo/patches/$p.patch"
             echo "  aplicado: $p"
           done
-          echo "Parches 0001..0006 aplicados."
+          echo "Parches 0001..0007 aplicados."
 
       # NOTA: aqui NO se corre `ant unit-tests` (ese target no depende de
       # download-javafx y el JDK del runner no trae JavaFX -> "package javafx... does
